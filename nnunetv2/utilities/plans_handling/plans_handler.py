@@ -74,8 +74,8 @@ class ConfigurationManager(object):
                         "eps": 1e-05,
                         "affine": True
                     },
-                    "dropout_op": None,
-                    "dropout_op_kwargs": None,
+                    'dropout_op': 'torch.nn.Dropout',
+                    'dropout_op_kwargs': {'p': 0.05, 'inplace': True},
                     "nonlin": "torch.nn.LeakyReLU",
                     "nonlin_kwargs": {
                         "inplace": True

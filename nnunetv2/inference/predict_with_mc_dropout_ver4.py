@@ -1,0 +1,1483 @@
+import inspect
+import itertools
+import multiprocessing
+import os
+
+from copy import deepcopy
+from queue import Queue
+from threading import Thread
+from time import sleep
+from typing import Tuple, Union, List, Optional
+
+import numpy as np
+import torch
+from acvl_utils.cropping_and_padding.padding import pad_nd_image
+from batchgenerators.dataloading.multi_threaded_augmenter import MultiThreadedAugmenter
+from batchgenerators.utilities.file_and_folder_operations import load_json, join, isfile, maybe_mkdir_p, isdir, subdirs, \
+    save_json
+from torch import nn
+from torch._dynamo import OptimizedModule
+from torch.nn.parallel import DistributedDataParallel
+from tqdm import tqdm
+
+import nnunetv2
+from nnunetv2.configuration import default_num_processes
+from nnunetv2.inference.data_iterators import PreprocessAdapterFromNpy, preprocessing_iterator_fromfiles, \
+    preprocessing_iterator_fromnpy
+from nnunetv2.inference.export_prediction import export_prediction_from_logits, \
+    convert_predicted_logits_to_segmentation_with_correct_shape
+from nnunetv2.inference.sliding_window_prediction import compute_gaussian, \
+    compute_steps_for_sliding_window
+from nnunetv2.utilities.file_path_utilities import get_output_folder, check_workers_alive_and_busy
+from nnunetv2.utilities.find_class_by_name import recursive_find_python_class
+from nnunetv2.utilities.helpers import empty_cache, dummy_context
+from nnunetv2.utilities.json_export import recursive_fix_for_json_export
+from nnunetv2.utilities.label_handling.label_handling import determine_num_input_channels
+from nnunetv2.utilities.plans_handling.plans_handler import PlansManager, ConfigurationManager
+from nnunetv2.utilities.utils import create_lists_from_splitted_dataset_folder
+
+def enable_mc_dropout(model):
+    """
+    Enable dropout layers during inference for MC Dropout and set dropout rate to p=0.05
+    Also checks that all Dropout layers are set to p=0.05.
+    """
+    for m in model.modules():
+        if m.__class__.__name__.startswith('Dropout'):
+            m.p = 0.05
+            m.train()
+    # Check all Dropout layers
+    incorrect = []
+    for name, m in model.named_modules():
+        if m.__class__.__name__.startswith('Dropout'):
+            if getattr(m, 'p', None) != 0.05:
+                incorrect.append((name, m.p))
+    if incorrect:
+        print(f"WARNING: The following Dropout layers do not have p=0.05: {incorrect}")
+    else:
+        print("All Dropout layers set to p=0.05 and enabled for MC Dropout.")
+
+
+def save_uncertainty_map_remap(uncertainty: np.ndarray, properties: dict, plans_manager, configuration_manager, output_path: str, label_manager=None):
+    import numpy as np
+    import nibabel as nib
+    
+    # Guarantee properties['spacing'] is present and a list of floats for downstream code
+    spacing_val = None
+    if 'spacing' in properties and isinstance(properties['spacing'], list):
+        spacing_val = [float(x) for x in properties['spacing']]
+    elif 'original_spacing' in properties and isinstance(properties['original_spacing'], list):
+        spacing_val = [float(x) for x in properties['original_spacing']]
+    elif 'shape_after_cropping_and_before_resampling' in properties:
+        # fallback: use [1.0, 1.0, 1.0] if nothing else is available
+        spacing_val = [1.0, 1.0, 1.0]
+    else:
+        spacing_val = [1.0, 1.0, 1.0]
+    properties['spacing'] = spacing_val
+    # The spacing has already been handled above, no need for additional processing
+    """
+    Remap and save the uncertainty map to the original image space using nnU-Net's remapping pipeline.
+    """
+    # uncertainty: (C, H, W, D) or (H, W, D) or (1, H, W, D)
+
+    print(f"[DEBUG] Uncertainty shape before channel check: {uncertainty.shape}, dtype: {uncertainty.dtype}")
+    if uncertainty.ndim == 3:
+        uncertainty = uncertainty[None, ...]
+        print(f"[DEBUG] Added channel dim, new shape: {uncertainty.shape}")
+    elif uncertainty.ndim == 4 and uncertainty.shape[0] != 1:
+        # If multiple channels, average across channels
+        uncertainty = np.mean(uncertainty, axis=0, keepdims=True)
+        print(f"[DEBUG] Averaged across channels, new shape: {uncertainty.shape}")
+
+    print(f"[DEBUG] Uncertainty shape before remap: {uncertainty.shape}, dtype: {uncertainty.dtype}")
+
+    # Use spatial resampling/uncropping for uncertainty map
+    from nnunetv2.preprocessing.resampling.default_resampling import resample_data_or_seg_to_shape
+    # Determine target shape (cropped shape)
+    target_shape = tuple(properties['size_after_cropping']) if 'size_after_cropping' in properties else uncertainty.shape[1:]
+    current_spacing = properties.get('current_spacing', None)
+    original_spacing = properties.get('spacing', None)
+    # Use properties['spacing'] directly if it's a list of numbers
+    if isinstance(original_spacing, list) and all(isinstance(x, (float, int)) for x in original_spacing):
+        pass  # already good
+    elif original_spacing is None:
+        if hasattr(configuration_manager, 'original_spacing'):
+            original_spacing = configuration_manager.original_spacing
+        elif hasattr(plans_manager, 'plans') and 'original_spacing' in plans_manager.plans:
+            original_spacing = plans_manager.plans['original_spacing']
+    # Fallback: if current_spacing is missing, use original_spacing
+    if current_spacing is None:
+        current_spacing = original_spacing
+    if current_spacing is None or original_spacing is None:
+        print(f"[WARNING] current_spacing or spacing not found in properties or plans/config, skipping resampling. current_spacing={current_spacing}, spacing={original_spacing}")
+        resampled = uncertainty
+    else:
+        print(f"[DEBUG] Using current_spacing={current_spacing}, spacing={original_spacing} for resampling.")
+        resampled = resample_data_or_seg_to_shape(
+            uncertainty,
+            target_shape,
+            current_spacing,
+            original_spacing,
+            is_seg=False,
+            order=3,  # cubic for uncertainty map
+            order_z=0
+        )
+    print(f"[DEBUG] Resampled uncertainty shape: {resampled.shape}, dtype: {resampled.dtype}")
+
+    # Uncrop to original image shape
+    if 'crop_bbox' in properties and 'size_before_cropping' in properties:
+        uncropped = np.zeros((resampled.shape[0], *properties['size_before_cropping']), dtype=resampled.dtype)
+        bbox = properties['crop_bbox']
+        if len(bbox) == 6:
+            x0, x1, y0, y1, z0, z1 = bbox
+            uncropped[:, x0:x1, y0:y1, z0:z1] = resampled
+        else:
+            raise ValueError(f"Unexpected crop_bbox format: {bbox}")
+        print(f"[DEBUG] Uncropped uncertainty shape: {uncropped.shape}, dtype: {uncropped.dtype}")
+    else:
+        uncropped = resampled
+
+    # Remove channel dim if single channel
+    if uncropped.shape[0] == 1:
+        uncropped = uncropped[0]
+
+    # CRITICAL: Apply the same transpose operations that nnU-Net uses for predictions
+    # This ensures the uncertainty map has the same orientation as the prediction
+    print(f"[DEBUG] Uncertainty shape before transpose: {uncropped.shape}")
+    
+    # Use nnU-Net's transpose_backward to convert from processing space to original space
+    if hasattr(plans_manager, 'transpose_backward') and plans_manager.transpose_backward is not None:
+        print(f"[DEBUG] Applying transpose_backward: {plans_manager.transpose_backward}")
+        uncropped = uncropped.transpose(plans_manager.transpose_backward)
+        print(f"[DEBUG] Uncertainty shape after transpose: {uncropped.shape}")
+    else:
+        print(f"[WARNING] No transpose_backward found in plans_manager. Available attributes: {dir(plans_manager)}")
+        # Check if it's stored under a different name
+        if hasattr(plans_manager, 'plans') and 'transpose_backward' in plans_manager.plans:
+            transpose_backward = plans_manager.plans['transpose_backward']
+            print(f"[DEBUG] Found transpose_backward in plans: {transpose_backward}")
+            uncropped = uncropped.transpose(transpose_backward)
+            print(f"[DEBUG] Uncertainty shape after transpose: {uncropped.shape}")
+        else:
+            print("[WARNING] Could not find transpose_backward anywhere, skipping nnU-Net transpose")
+
+    # CRITICAL: Check if we need additional transpose to match original image orientation
+    if 'path' in properties and properties['path'] is not None:
+        try:
+            original_nii = nib.load(properties['path'])
+            original_data = original_nii.get_fdata()
+            
+            print(f"[DEBUG] Original image shape: {original_data.shape}")
+            print(f"[DEBUG] Uncertainty shape after nnU-Net transpose: {uncropped.shape}")
+            
+            # If shapes still don't match after nnU-Net transpose, try additional fixes
+            if uncropped.shape != original_data.shape:
+                print(f"[WARNING] Shape mismatch after nnU-Net transpose - Original: {original_data.shape}, Uncertainty: {uncropped.shape}")
+                
+                # Try to find the correct orientation by checking which transpose gives matching shape
+                if len(uncropped.shape) == 3 and len(original_data.shape) == 3:
+                    # Try different transpose permutations
+                    permutations = [(0,1,2), (0,2,1), (1,0,2), (1,2,0), (2,0,1), (2,1,0)]
+                    for perm in permutations:
+                        transposed = uncropped.transpose(perm)
+                        if transposed.shape == original_data.shape:
+                            uncropped = transposed
+                            print(f"[DEBUG] Applied additional transpose {perm} to match original orientation")
+                            break
+                    else:
+                        print("[WARNING] Could not find matching transpose, keeping nnU-Net transpose result")
+            else:
+                print("[DEBUG] Shapes match after nnU-Net transpose - perfect!")
+                
+        except Exception as e:
+            print(f"[WARNING] Could not load original image for orientation check: {e}")
+
+    uncropped = uncropped.astype(np.float32)
+
+    import nibabel as nib
+    
+    # CRITICAL: Use the original image's affine and header to preserve orientation
+    if 'path' in properties and properties['path'] is not None:
+        try:
+            print(f"[DEBUG] Attempting to load original image from: {properties['path']}")
+            original_nii = nib.load(properties['path'])
+            affine = original_nii.affine.copy()
+            header = original_nii.header.copy()
+            print(f"[DEBUG] ✅ Successfully loaded original image affine from: {properties['path']}")
+            print(f"[DEBUG] Original affine:\n{affine}")
+        except Exception as e:
+            print(f"[ERROR] Failed to load original image from {properties['path']}: {e}")
+            print("[WARNING] Using identity affine as fallback")
+            affine = np.eye(4)
+            header = None
+    else:
+        # Fallback: create identity affine (but this might cause orientation issues)
+        affine = np.eye(4)
+        header = None
+        print(f"[WARNING] No original image path found in properties: {properties.keys()}")
+        print("[WARNING] Using identity affine")
+    
+    # Save uncertainty map with correct affine/header
+    uncertainty_nii = nib.Nifti1Image(uncropped, affine, header)
+    nib.save(uncertainty_nii, output_path)
+    print(f"✅ Saved remapped uncertainty map to: {output_path}")
+    print(f"[DEBUG] Saved uncertainty shape: {uncropped.shape}")
+    print(f"[DEBUG] Saved uncertainty affine:\n{affine}")                                                                                    
+
+
+
+from copy import deepcopy
+
+class nnUNetPredictor(object):
+    def __init__(self,
+                 tile_step_size: float = 0.5,
+                 use_gaussian: bool = True,
+                 use_mirroring: bool = True,
+                 perform_everything_on_device: bool = True,
+                 device: torch.device = torch.device('cuda'),
+                 verbose: bool = False,
+                 verbose_preprocessing: bool = False,
+                 allow_tqdm: bool = True):
+        self.verbose = verbose
+        self.verbose_preprocessing = verbose_preprocessing
+        self.allow_tqdm = allow_tqdm
+
+        self.plans_manager, self.configuration_manager, self.list_of_parameters, self.network, self.dataset_json, \
+        self.trainer_name, self.allowed_mirroring_axes, self.label_manager = None, None, None, None, None, None, None, None
+
+        self.tile_step_size = tile_step_size
+        self.use_gaussian = use_gaussian
+        self.use_mirroring = use_mirroring
+        if device.type == 'cuda':
+            torch.backends.cudnn.benchmark = True
+        else:
+            print(f'perform_everything_on_device=True is only supported for cuda devices! Setting this to False')
+            perform_everything_on_device = False
+        self.device = device
+        self.perform_everything_on_device = perform_everything_on_device
+        # Initialize uncertainty tracking
+        self.latest_uncertainty_map = None
+
+    def initialize_from_trained_model_folder(self, model_training_output_dir: str,
+                                             use_folds: Union[Tuple[Union[int, str]], None],
+                                             checkpoint_name: str = 'checkpoint_final.pth'):
+        """
+        This is used when making predictions with a trained model
+        """
+        if use_folds is None:
+            use_folds = nnUNetPredictor.auto_detect_available_folds(model_training_output_dir, checkpoint_name)
+
+        dataset_json = load_json(join(model_training_output_dir, 'dataset.json'))
+        plans = load_json(join(model_training_output_dir, 'plans.json'))
+        plans_manager = PlansManager(plans)
+
+        if isinstance(use_folds, str):
+            use_folds = [use_folds]
+        print(f"DEBUG: use_folds = {use_folds}")
+
+        parameters = []
+        for i, f in enumerate(use_folds):
+            if str(f).lower() == 'all':
+                checkpoint_path = join(model_training_output_dir, 'fold_all', checkpoint_name)
+            else:
+                f = int(f)
+                checkpoint_path = join(model_training_output_dir, f'fold_{f}', checkpoint_name)
+                                        
+            checkpoint = torch.load(checkpoint_path, map_location=torch.device('cpu'), weights_only=False)
+                                            
+            if i == 0:
+                trainer_name = checkpoint['trainer_name']
+                configuration_name = checkpoint['init_args']['configuration']
+                inference_allowed_mirroring_axes = checkpoint['inference_allowed_mirroring_axes'] if \
+                    'inference_allowed_mirroring_axes' in checkpoint.keys() else None
+
+            parameters.append(checkpoint['network_weights'])
+
+        configuration_manager = plans_manager.get_configuration(configuration_name)
+        # restore network
+        num_input_channels = determine_num_input_channels(plans_manager, configuration_manager, dataset_json)
+        trainer_class = recursive_find_python_class(join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
+                                                    trainer_name, 'nnunetv2.training.nnUNetTrainer')
+        if trainer_class is None:
+            raise RuntimeError(f'Unable to locate trainer class {trainer_name} in nnunetv2.training.nnUNetTrainer. '
+                               f'Please place it there (in any .py file)!')
+        network = trainer_class.build_network_architecture(
+            configuration_manager.network_arch_class_name,
+            configuration_manager.network_arch_init_kwargs,
+            configuration_manager.network_arch_init_kwargs_req_import,
+            num_input_channels,
+            plans_manager.get_label_manager(dataset_json).num_segmentation_heads,
+            enable_deep_supervision=False
+        )
+
+        self.plans_manager = plans_manager
+        self.configuration_manager = configuration_manager
+        self.list_of_parameters = parameters
+
+        # initialize network with first set of parameters, also see https://github.com/MIC-DKFZ/nnUNet/issues/2520
+        network.load_state_dict(parameters[0])
+
+        self.network = network
+
+        self.dataset_json = dataset_json
+        self.trainer_name = trainer_name
+        self.allowed_mirroring_axes = inference_allowed_mirroring_axes
+        self.label_manager = plans_manager.get_label_manager(dataset_json)
+        if ('nnUNet_compile' in os.environ.keys()) and (os.environ['nnUNet_compile'].lower() in ('true', '1', 't')) \
+                and not isinstance(self.network, OptimizedModule):
+            print('Using torch.compile')
+            self.network = torch.compile(self.network)
+
+    def manual_initialization(self, network: nn.Module, plans_manager: PlansManager,
+                              configuration_manager: ConfigurationManager, parameters: Optional[List[dict]],
+                              dataset_json: dict, trainer_name: str,
+                              inference_allowed_mirroring_axes: Optional[Tuple[int, ...]]):
+        """
+        This is used by the nnUNetTrainer to initialize nnUNetPredictor for the final validation
+        """
+        self.plans_manager = plans_manager
+        self.configuration_manager = configuration_manager
+        self.list_of_parameters = parameters
+        self.network = network
+        self.dataset_json = dataset_json
+        self.trainer_name = trainer_name
+        self.allowed_mirroring_axes = inference_allowed_mirroring_axes
+        self.label_manager = plans_manager.get_label_manager(dataset_json)
+        allow_compile = True
+        allow_compile = allow_compile and ('nnUNet_compile' in os.environ.keys()) and (
+                    os.environ['nnUNet_compile'].lower() in ('true', '1', 't'))
+        allow_compile = allow_compile and not isinstance(self.network, OptimizedModule)
+        if isinstance(self.network, DistributedDataParallel):
+            allow_compile = allow_compile and isinstance(self.network.module, OptimizedModule)
+        if allow_compile:
+            print('Using torch.compile')
+            self.network = torch.compile(self.network)
+
+    @staticmethod
+    def auto_detect_available_folds(model_training_output_dir, checkpoint_name):
+        print('use_folds is None, attempting to auto detect available folds')
+        fold_folders = subdirs(model_training_output_dir, prefix='fold_', join=False)
+        fold_folders = [i for i in fold_folders if i != 'fold_all']
+        fold_folders = [i for i in fold_folders if isfile(join(model_training_output_dir, i, checkpoint_name))]
+        use_folds = [int(i.split('_')[-1]) for i in fold_folders]
+        print(f'found the following folds: {use_folds}')
+        return use_folds
+
+    def _manage_input_and_output_lists(self, list_of_lists_or_source_folder: Union[str, List[List[str]]],
+                                       output_folder_or_list_of_truncated_output_files: Union[None, str, List[str]],
+                                       folder_with_segs_from_prev_stage: str = None,
+                                       overwrite: bool = True,
+                                       part_id: int = 0,
+                                       num_parts: int = 1,
+                                       save_probabilities: bool = False):
+        if isinstance(list_of_lists_or_source_folder, str):
+            list_of_lists_or_source_folder = create_lists_from_splitted_dataset_folder(list_of_lists_or_source_folder,
+                                                                                       self.dataset_json['file_ending'])
+        print(f'There are {len(list_of_lists_or_source_folder)} cases in the source folder')
+        list_of_lists_or_source_folder = list_of_lists_or_source_folder[part_id::num_parts]
+        caseids = [os.path.basename(i[0])[:-(len(self.dataset_json['file_ending']) + 5)] for i in
+                   list_of_lists_or_source_folder]
+        print(
+            f'I am processing {part_id} out of {num_parts} (max process ID is {num_parts - 1}, we start counting with 0!)')
+        print(f'There are {len(caseids)} cases that I would like to predict')
+
+        if isinstance(output_folder_or_list_of_truncated_output_files, str):
+            output_filename_truncated = [join(output_folder_or_list_of_truncated_output_files, i) for i in caseids]
+        elif isinstance(output_folder_or_list_of_truncated_output_files, list):
+            output_filename_truncated = output_folder_or_list_of_truncated_output_files[part_id::num_parts]
+        else:
+            output_filename_truncated = None
+        seg_from_prev_stage_files = [join(folder_with_segs_from_prev_stage, i + self.dataset_json['file_ending']) if
+                                     folder_with_segs_from_prev_stage is not None else None for i in caseids]
+        # remove already predicted files from the lists
+        if not overwrite and output_filename_truncated is not None:
+            tmp = [isfile(i + self.dataset_json['file_ending']) for i in output_filename_truncated]
+            if save_probabilities:
+                tmp2 = [isfile(i + '.npz') for i in output_filename_truncated]
+                tmp = [i and j for i, j in zip(tmp, tmp2)]
+            not_existing_indices = [i for i, j in enumerate(tmp) if not j]
+
+            output_filename_truncated = [output_filename_truncated[i] for i in not_existing_indices]
+            list_of_lists_or_source_folder = [list_of_lists_or_source_folder[i] for i in not_existing_indices]
+            seg_from_prev_stage_files = [seg_from_prev_stage_files[i] for i in not_existing_indices]
+            print(f'overwrite was set to {overwrite}, so I am only working on cases that haven\'t been predicted yet. '
+                  f'That\'s {len(not_existing_indices)} cases.')
+        return list_of_lists_or_source_folder, output_filename_truncated, seg_from_prev_stage_files
+
+    def predict_from_files(self,
+                           list_of_lists_or_source_folder: Union[str, List[List[str]]],
+                           output_folder_or_list_of_truncated_output_files: Union[str, None, List[str]],
+                           save_probabilities: bool = False,
+                           overwrite: bool = True,
+                           num_processes_preprocessing: int = default_num_processes,
+                           num_processes_segmentation_export: int = default_num_processes,
+                           folder_with_segs_from_prev_stage: str = None,
+                           num_parts: int = 1,
+                           part_id: int = 0):
+        """
+        This is nnU-Net's default function for making predictions. It works best for batch predictions
+        (predicting many images at once).
+        """
+        assert part_id <= num_parts, ("Part ID must be smaller than num_parts. Remember that we start counting with 0. "
+                                      "So if there are 3 parts then valid part IDs are 0, 1, 2")
+        if isinstance(output_folder_or_list_of_truncated_output_files, str):
+            output_folder = output_folder_or_list_of_truncated_output_files
+        elif isinstance(output_folder_or_list_of_truncated_output_files, list):
+            output_folder = os.path.dirname(output_folder_or_list_of_truncated_output_files[0])
+        else:
+            output_folder = None
+
+        ########################
+        # let's store the input arguments so that its clear what was used to generate the prediction
+        if output_folder is not None:
+            my_init_kwargs = {}
+            for k in inspect.signature(self.predict_from_files).parameters.keys():
+                my_init_kwargs[k] = locals()[k]
+            my_init_kwargs = deepcopy(
+                my_init_kwargs)  # let's not unintentionally change anything in-place. Take this as a
+            recursive_fix_for_json_export(my_init_kwargs)
+            maybe_mkdir_p(output_folder)
+            save_json(my_init_kwargs, join(output_folder, 'predict_from_raw_data_args.json'))
+
+            # we need these two if we want to do things with the predictions like for example apply postprocessing
+            save_json(self.dataset_json, join(output_folder, 'dataset.json'), sort_keys=False)
+            save_json(self.plans_manager.plans, join(output_folder, 'plans.json'), sort_keys=False)
+        #######################
+
+        # check if we need a prediction from the previous stage
+        if self.configuration_manager.previous_stage_name is not None:
+            assert folder_with_segs_from_prev_stage is not None, \
+                f'The requested configuration is a cascaded network. It requires the segmentations of the previous ' \
+                f'stage ({self.configuration_manager.previous_stage_name}) as input. Please provide the folder where' \
+                f' they are located via folder_with_segs_from_prev_stage'
+
+        # sort out input and output filenames
+        list_of_lists_or_source_folder, output_filename_truncated, seg_from_prev_stage_files = \
+            self._manage_input_and_output_lists(list_of_lists_or_source_folder,
+                                                output_folder_or_list_of_truncated_output_files,
+                                                folder_with_segs_from_prev_stage, overwrite, part_id, num_parts,
+                                                save_probabilities)
+        if len(list_of_lists_or_source_folder) == 0:
+            return
+
+        data_iterator = self._internal_get_data_iterator_from_lists_of_filenames(list_of_lists_or_source_folder,
+                                                                                 seg_from_prev_stage_files,
+                                                                                 output_filename_truncated,
+                                                                                 num_processes_preprocessing)
+
+        return self.predict_from_data_iterator(data_iterator, save_probabilities, num_processes_segmentation_export)
+
+    def _internal_get_data_iterator_from_lists_of_filenames(self,
+                                                            input_list_of_lists: List[List[str]],
+                                                            seg_from_prev_stage_files: Union[List[str], None],
+                                                            output_filenames_truncated: Union[List[str], None],
+                                                            num_processes: int):
+        return preprocessing_iterator_fromfiles(input_list_of_lists, seg_from_prev_stage_files,
+                                                output_filenames_truncated, self.plans_manager, self.dataset_json,
+                                                self.configuration_manager, num_processes, self.device.type == 'cuda',
+                                                self.verbose_preprocessing)
+        # preprocessor = self.configuration_manager.preprocessor_class(verbose=self.verbose_preprocessing)
+        # # hijack batchgenerators, yo
+        # # we use the multiprocessing of the batchgenerators dataloader to handle all the background worker stuff. This
+        # # way we don't have to reinvent the wheel here.
+        # num_processes = max(1, min(num_processes, len(input_list_of_lists)))
+        # ppa = PreprocessAdapter(input_list_of_lists, seg_from_prev_stage_files, preprocessor,
+        #                         output_filenames_truncated, self.plans_manager, self.dataset_json,
+        #                         self.configuration_manager, num_processes)
+        # if num_processes == 0:
+        #     mta = SingleThreadedAugmenter(ppa, None)
+        # else:
+        #     mta = MultiThreadedAugmenter(ppa, None, num_processes, 1, None, pin_memory=pin_memory)
+        # return mta
+
+    def get_data_iterator_from_raw_npy_data(self,
+                                            image_or_list_of_images: Union[np.ndarray, List[np.ndarray]],
+                                            segs_from_prev_stage_or_list_of_segs_from_prev_stage: Union[None,
+                                                                                                        np.ndarray,
+                                                                                                        List[
+                                                                                                            np.ndarray]],
+                                            properties_or_list_of_properties: Union[dict, List[dict]],
+                                            truncated_ofname: Union[str, List[str], None],
+                                            num_processes: int = 3):
+
+        list_of_images = [image_or_list_of_images] if not isinstance(image_or_list_of_images, list) else \
+            image_or_list_of_images
+
+        if isinstance(segs_from_prev_stage_or_list_of_segs_from_prev_stage, np.ndarray):
+            segs_from_prev_stage_or_list_of_segs_from_prev_stage = [
+                segs_from_prev_stage_or_list_of_segs_from_prev_stage]
+
+        if isinstance(truncated_ofname, str):
+            truncated_ofname = [truncated_ofname]
+
+        if isinstance(properties_or_list_of_properties, dict):
+            properties_or_list_of_properties = [properties_or_list_of_properties]
+
+        num_processes = min(num_processes, len(list_of_images))
+        pp = preprocessing_iterator_fromnpy(
+            list_of_images,
+            segs_from_prev_stage_or_list_of_segs_from_prev_stage,
+            properties_or_list_of_properties,
+            truncated_ofname,
+            self.plans_manager,
+            self.dataset_json,
+            self.configuration_manager,
+            num_processes,
+            self.device.type == 'cuda',
+            self.verbose_preprocessing
+        )
+
+        return pp
+
+    def predict_from_list_of_npy_arrays(self,
+                                        image_or_list_of_images: Union[np.ndarray, List[np.ndarray]],
+                                        segs_from_prev_stage_or_list_of_segs_from_prev_stage: Union[None,
+                                                                                                    np.ndarray,
+                                                                                                    List[
+                                                                                                        np.ndarray]],
+                                        properties_or_list_of_properties: Union[dict, List[dict]],
+                                        truncated_ofname: Union[str, List[str], None],
+                                        num_processes: int = 3,
+                                        save_probabilities: bool = False,
+                                        num_processes_segmentation_export: int = default_num_processes):
+        iterator = self.get_data_iterator_from_raw_npy_data(image_or_list_of_images,
+                                                            segs_from_prev_stage_or_list_of_segs_from_prev_stage,
+                                                            properties_or_list_of_properties,
+                                                            truncated_ofname,
+                                                            num_processes)
+        return self.predict_from_data_iterator(iterator, save_probabilities, num_processes_segmentation_export)
+
+    def predict_from_data_iterator(self,
+                                   data_iterator,
+                                   save_probabilities: bool = False,
+                                   num_processes_segmentation_export: int = default_num_processes):
+        """
+        each element returned by data_iterator must be a dict with 'data', 'ofile' and 'data_properties' keys!
+        If 'ofile' is None, the result will be returned instead of written to a file
+        """
+        with multiprocessing.get_context("spawn").Pool(num_processes_segmentation_export) as export_pool:
+            worker_list = [i for i in export_pool._pool]
+            r = []
+            for preprocessed in data_iterator:
+                data = preprocessed['data']
+                if isinstance(data, str):
+                    delfile = data
+                    data = torch.from_numpy(np.load(data))
+                    os.remove(delfile)
+
+                ofile = preprocessed['ofile']
+                if ofile is not None:
+                    print(f'\nPredicting {os.path.basename(ofile)}:')
+                else:
+                    print(f'\nPredicting image of shape {data.shape}:')
+
+                print(f'perform_everything_on_device: {self.perform_everything_on_device}')
+
+                properties = preprocessed['data_properties']
+
+                # let's not get into a runaway situation where the GPU predicts so fast that the disk has to be swamped with
+                # npy files
+                proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
+                while not proceed:
+                    sleep(0.1)
+                    proceed = not check_workers_alive_and_busy(export_pool, worker_list, r, allowed_num_queued=2)
+
+                # convert to numpy to prevent uncatchable memory alignment errors from multiprocessing serialization of torch tensors
+                prediction = self.predict_logits_from_preprocessed_data(data).cpu().detach().numpy()
+
+                if ofile is not None:
+                    print('sending off prediction to background worker for resampling and export')
+                    r.append(
+                        export_pool.starmap_async(
+                            export_prediction_from_logits,
+                            ((prediction, properties, self.configuration_manager, self.plans_manager,
+                              self.dataset_json, ofile, save_probabilities),)
+                        )
+                    )
+                else:
+                    print('sending off prediction to background worker for resampling')
+                    r.append(
+                        export_pool.starmap_async(
+                            convert_predicted_logits_to_segmentation_with_correct_shape, (
+                                (prediction, self.plans_manager,
+                                 self.configuration_manager, self.label_manager,
+                                 properties,
+                                 save_probabilities),)
+                        )
+                    )
+                if ofile is not None:
+                    print(f'done with {os.path.basename(ofile)}')
+                else:
+                    print(f'\nDone with image of shape {data.shape}:')
+            ret = [i.get()[0] for i in r]
+
+        if isinstance(data_iterator, MultiThreadedAugmenter):
+            data_iterator._finish()
+
+        # clear lru cache
+        compute_gaussian.cache_clear()
+        # clear device cache
+        empty_cache(self.device)
+        return ret
+
+    def predict_single_npy_array(self, input_image: np.ndarray, image_properties: dict,
+                                 segmentation_previous_stage: np.ndarray = None,
+                                 output_file_truncated: str = None,
+                                 save_or_return_probabilities: bool = False):
+        """
+        WARNING: SLOW. ONLY USE THIS IF YOU CANNOT GIVE NNUNET MULTIPLE IMAGES AT ONCE FOR SOME REASON.
+
+
+        input_image: Make sure to load the image in the way nnU-Net expects! nnU-Net is trained on a certain axis
+                     ordering which cannot be disturbed in inference,
+                     otherwise you will get bad results. The easiest way to achieve that is to use the same I/O class
+                     for loading images as was used during nnU-Net preprocessing! You can find that class in your
+                     plans.json file under the key "image_reader_writer". If you decide to freestyle, know that the
+                     default axis ordering for medical images is the one from SimpleITK. If you load with nibabel,
+                     you need to transpose your axes AND your spacing from [x,y,z] to [z,y,x]!
+        image_properties must only have a 'spacing' key!
+        """
+        ppa = PreprocessAdapterFromNpy([input_image], [segmentation_previous_stage], [image_properties],
+                                       [output_file_truncated],
+                                       self.plans_manager, self.dataset_json, self.configuration_manager,
+                                       num_threads_in_multithreaded=1, verbose=self.verbose)
+        if self.verbose:
+            print('preprocessing')
+        dct = next(ppa)
+
+        if self.verbose:
+            print('predicting')
+        predicted_logits = self.predict_logits_from_preprocessed_data(dct['data']).cpu()
+
+        if self.verbose:
+            print('resampling to original shape')
+        if output_file_truncated is not None:
+            export_prediction_from_logits(predicted_logits, dct['data_properties'], self.configuration_manager,
+                                          self.plans_manager, self.dataset_json, output_file_truncated,
+                                          save_or_return_probabilities)
+        else:
+            ret = convert_predicted_logits_to_segmentation_with_correct_shape(predicted_logits, self.plans_manager,
+                                                                              self.configuration_manager,
+                                                                              self.label_manager,
+                                                                              dct['data_properties'],
+                                                                              return_probabilities=
+                                                                              save_or_return_probabilities)
+            if save_or_return_probabilities:
+                return ret[0], ret[1]
+            else:
+                return ret
+
+    @torch.inference_mode()
+    def predict_logits_from_preprocessed_data(self, data: torch.Tensor) -> torch.Tensor:
+        """
+        IMPORTANT! IF YOU ARE RUNNING THE CASCADE, THE SEGMENTATION FROM THE PREVIOUS STAGE MUST ALREADY BE STACKED ON
+        TOP OF THE IMAGE AS ONE-HOT REPRESENTATION! SEE PreprocessAdapter ON HOW THIS SHOULD BE DONE!
+
+        RETURNED LOGITS HAVE THE SHAPE OF THE INPUT. THEY MUST BE CONVERTED BACK TO THE ORIGINAL IMAGE SIZE.
+        SEE convert_predicted_logits_to_segmentation_with_correct_shape
+        """
+        n_threads = torch.get_num_threads()
+        torch.set_num_threads(default_num_processes if default_num_processes < n_threads else n_threads)
+        prediction = None
+
+        for params in self.list_of_parameters:
+
+            # messing with state dict names...
+            if not isinstance(self.network, OptimizedModule):
+                self.network.load_state_dict(params)
+            else:
+                self.network._orig_mod.load_state_dict(params)
+
+            # why not leave prediction on device if perform_everything_on_device? Because this may cause the
+            # second iteration to crash due to OOM. Grabbing that with try except cause way more bloated code than
+            # this actually saves computation time
+            if prediction is None:
+                prediction = self.predict_sliding_window_return_logits_with_mc_dropout(data).to('cpu')
+            else:
+                prediction += self.predict_sliding_window_return_logits_with_mc_dropout(data).to('cpu')
+
+        if len(self.list_of_parameters) > 1:
+            prediction /= len(self.list_of_parameters)
+
+        if self.verbose: print('Prediction done')
+        torch.set_num_threads(n_threads)
+        return prediction
+
+    @torch.inference_mode()
+    def predict_sliding_window_return_logits_with_mc_dropout(self, input_image: torch.Tensor, num_mc_passes: int = 20) -> Union[np.ndarray, torch.Tensor]:
+        """
+        Sliding window prediction with MC dropout for uncertainty estimation.
+        """
+        assert isinstance(input_image, torch.Tensor)
+        self.network = self.network.to(self.device)
+        self.network.eval()
+        
+        # Enable MC dropout
+        enable_mc_dropout(self.network)
+
+        empty_cache(self.device)
+
+        with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            assert input_image.ndim == 4, 'input_image must be a 4D np.ndarray or torch.Tensor (c, x, y, z)'
+
+            if self.verbose:
+                print(f'Input shape: {input_image.shape}')
+                print("step_size:", self.tile_step_size)
+                print("mirror_axes:", self.allowed_mirroring_axes if self.use_mirroring else None)
+
+            # if input_image is smaller than tile_size we need to pad it to tile_size.
+            data, slicer_revert_padding = pad_nd_image(input_image, self.configuration_manager.patch_size,
+                                                       'constant', {'value': 0}, True,
+                                                       None)
+
+            slicers = self._internal_get_sliding_window_slicers(data.shape[1:])
+
+            # Perform MC dropout across the entire image
+            mc_predictions = []
+            mc_uncertainties = []
+            
+            for mc_pass in range(num_mc_passes):
+                if self.verbose and mc_pass % 5 == 0:
+                    print(f'MC dropout pass {mc_pass + 1}/{num_mc_passes}')
+                
+                if self.perform_everything_on_device and self.device != 'cpu':
+                    try:
+                        pred_logits = self._internal_predict_sliding_window_return_logits(data, slicers, self.perform_everything_on_device)
+                    except RuntimeError:
+                        print('Prediction on device was unsuccessful, probably due to a lack of memory. Moving results arrays to CPU')
+                        empty_cache(self.device)
+                        pred_logits = self._internal_predict_sliding_window_return_logits(data, slicers, False)
+                else:
+                    pred_logits = self._internal_predict_sliding_window_return_logits(data, slicers, self.perform_everything_on_device)
+                
+                mc_predictions.append(pred_logits.unsqueeze(0))  # Add MC dimension
+            
+            # Stack all MC predictions
+            mc_predictions = torch.cat(mc_predictions, dim=0)  # Shape: (num_mc_passes, num_classes, x, y, z)
+            
+            # Calculate uncertainty using predictive entropy
+            mc_probs = torch.softmax(mc_predictions, dim=1)  # Convert to probabilities
+            mean_probs = mc_probs.mean(dim=0)  # Average across MC passes
+            
+            # Calculate predictive entropy
+            eps = 1e-8
+            entropy = -(mean_probs * torch.log(mean_probs + eps)).sum(dim=0, keepdim=True)  # Sum over class dimension
+            
+            # Normalize entropy
+            num_classes = mc_probs.shape[1]
+            max_entropy = torch.log(torch.tensor(num_classes, dtype=entropy.dtype, device=entropy.device))
+            normalized_entropy = entropy / max_entropy
+            
+            # Store uncertainty map (revert padding)
+            uncertainty_map = normalized_entropy[(slice(None), *slicer_revert_padding[1:])]
+            self.latest_uncertainty_map = uncertainty_map
+            
+            # Get mean prediction logits
+            mean_prediction = mc_predictions.mean(dim=0)  # Average across MC passes
+            
+            empty_cache(self.device)
+            # revert padding
+            predicted_logits = mean_prediction[(slice(None), *slicer_revert_padding[1:])]
+            
+        return predicted_logits
+
+    def _internal_get_sliding_window_slicers(self, image_size: Tuple[int, ...]):
+        slicers = []
+        if len(self.configuration_manager.patch_size) < len(image_size):
+            assert len(self.configuration_manager.patch_size) == len(
+                image_size) - 1, 'if tile_size has less entries than image_size, ' \
+                                 'len(tile_size) ' \
+                                 'must be one shorter than len(image_size) ' \
+                                 '(only dimension ' \
+                                 'discrepancy of 1 allowed).'
+            steps = compute_steps_for_sliding_window(image_size[1:], self.configuration_manager.patch_size,
+                                                     self.tile_step_size)
+            if self.verbose: print(f'n_steps {image_size[0] * len(steps[0]) * len(steps[1])}, image size is'
+                                   f' {image_size}, tile_size {self.configuration_manager.patch_size}, '
+                                   f'tile_step_size {self.tile_step_size}\nsteps:\n{steps}')
+            for d in range(image_size[0]):
+                for sx in steps[0]:
+                    for sy in steps[1]:
+                        slicers.append(
+                            tuple([slice(None), d, *[slice(si, si + ti) for si, ti in
+                                                     zip((sx, sy), self.configuration_manager.patch_size)]]))
+        else:
+            steps = compute_steps_for_sliding_window(image_size, self.configuration_manager.patch_size,
+                                                     self.tile_step_size)
+            if self.verbose: print(
+                f'n_steps {np.prod([len(i) for i in steps])}, image size is {image_size}, tile_size {self.configuration_manager.patch_size}, '
+                f'tile_step_size {self.tile_step_size}\nsteps:\n{steps}')
+            for sx in steps[0]:
+                for sy in steps[1]:
+                    for sz in steps[2]:
+                        slicers.append(
+                            tuple([slice(None), *[slice(si, si + ti) for si, ti in
+                                                  zip((sx, sy, sz), self.configuration_manager.patch_size)]]))
+        return slicers
+
+    @torch.inference_mode()
+    def _internal_maybe_mirror_and_predict(self, x: torch.Tensor) -> torch.Tensor:
+        mirror_axes = self.allowed_mirroring_axes if self.use_mirroring else None
+        prediction = self.network(x)
+        
+        if mirror_axes is not None:
+            # check for invalid numbers in mirror_axes
+            assert max(mirror_axes) <= x.ndim - 3, 'mirror_axes does not match the dimension of the input!'
+            import itertools
+            mirror_axes = [m + 2 for m in mirror_axes]
+            axes_combinations = [
+                c for i in range(len(mirror_axes)) for c in itertools.combinations(mirror_axes, i + 1)
+            ]
+            for axes in axes_combinations:
+                prediction += torch.flip(self.network(torch.flip(x, axes)), axes)
+            prediction /= (len(axes_combinations) + 1)
+        
+        return prediction
+
+    @torch.inference_mode()
+    def _internal_predict_sliding_window_return_logits(self,
+                                                       data: torch.Tensor,
+                                                       slicers,
+                                                       do_on_device: bool = True,
+                                                       ):
+        predicted_logits = n_predictions = prediction = gaussian = workon = None
+        results_device = self.device if do_on_device else torch.device('cpu')
+
+        def producer(d, slh, q):
+            for s in slh:
+                q.put((torch.clone(d[s][None], memory_format=torch.contiguous_format).to(self.device), s))
+            q.put('end')
+
+        try:
+            empty_cache(self.device)
+
+            # move data to device
+            if self.verbose:
+                print(f'move image to device {results_device}')
+            data = data.to(results_device)
+            queue = Queue(maxsize=2)
+            t = Thread(target=producer, args=(data, slicers, queue))
+            t.start()
+
+            # preallocate arrays
+            if self.verbose:
+                print(f'preallocating results arrays on device {results_device}')
+            predicted_logits = torch.zeros((self.label_manager.num_segmentation_heads, *data.shape[1:]),
+                                           dtype=torch.half,
+                                           device=results_device)
+            n_predictions = torch.zeros(data.shape[1:], dtype=torch.half, device=results_device)
+
+            if self.use_gaussian:
+                gaussian = compute_gaussian(tuple(self.configuration_manager.patch_size), sigma_scale=1. / 8,
+                                            value_scaling_factor=10,
+                                            device=results_device)
+            else:
+                gaussian = 1
+
+            if not self.allow_tqdm and self.verbose:
+                print(f'running prediction: {len(slicers)} steps')
+
+            with tqdm(desc=None, total=len(slicers), disable=not self.allow_tqdm) as pbar:
+                while True:
+                    item = queue.get()
+                    if item == 'end':
+                        queue.task_done()
+                        break
+                    workon, sl = item
+                    prediction = self._internal_maybe_mirror_and_predict(workon)[0].to(results_device)
+
+                    if self.use_gaussian:
+                        prediction *= gaussian
+                    predicted_logits[sl] += prediction
+                    n_predictions[sl[1:]] += gaussian
+                    queue.task_done()
+                    pbar.update()
+            queue.join()
+
+            # predicted_logits /= n_predictions
+            torch.div(predicted_logits, n_predictions, out=predicted_logits)
+            # check for infs
+            if torch.any(torch.isinf(predicted_logits)):
+                raise RuntimeError('Encountered inf in predicted array. Aborting... If this problem persists, '
+                                   'reduce value_scaling_factor in compute_gaussian or increase the dtype of '
+                                   'predicted_logits to fp32')
+        except Exception as e:
+            del predicted_logits, n_predictions, prediction, gaussian, workon
+            empty_cache(self.device)
+            empty_cache(results_device)
+            raise e
+        return predicted_logits
+
+    @torch.inference_mode()
+    def predict_sliding_window_return_logits(self, input_image: torch.Tensor) \
+            -> Union[np.ndarray, torch.Tensor]:
+        assert isinstance(input_image, torch.Tensor)
+        self.network = self.network.to(self.device)
+        self.network.eval()
+
+        empty_cache(self.device)
+
+        # Autocast can be annoying
+        # If the device_type is 'cpu' then it's slow as heck on some CPUs (no auto bfloat16 support detection)
+        # and needs to be disabled.
+        # If the device_type is 'mps' then it will complain that mps is not implemented, even if enabled=False
+        # is set. Whyyyyyyy. (this is why we don't make use of enabled=False)
+        # So autocast will only be active if we have a cuda device.
+        with torch.autocast(self.device.type, enabled=True) if self.device.type == 'cuda' else dummy_context():
+            assert input_image.ndim == 4, 'input_image must be a 4D np.ndarray or torch.Tensor (c, x, y, z)'
+
+            if self.verbose:
+                print(f'Input shape: {input_image.shape}')
+                print("step_size:", self.tile_step_size)
+                print("mirror_axes:", self.allowed_mirroring_axes if self.use_mirroring else None)
+
+            # if input_image is smaller than tile_size we need to pad it to tile_size.
+            data, slicer_revert_padding = pad_nd_image(input_image, self.configuration_manager.patch_size,
+                                                       'constant', {'value': 0}, True,
+                                                       None)
+
+            slicers = self._internal_get_sliding_window_slicers(data.shape[1:])
+
+            if self.perform_everything_on_device and self.device != 'cpu':
+                # we need to try except here because we can run OOM in which case we need to fall back to CPU as a results device
+                try:
+                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
+                                                                                           self.perform_everything_on_device)
+                except RuntimeError:
+                    print(
+                        'Prediction on device was unsuccessful, probably due to a lack of memory. Moving results arrays to CPU')
+                    empty_cache(self.device)
+                    predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers, False)
+            else:
+                predicted_logits = self._internal_predict_sliding_window_return_logits(data, slicers,
+                                                                                       self.perform_everything_on_device)
+
+            empty_cache(self.device)
+            # revert padding
+            predicted_logits = predicted_logits[(slice(None), *slicer_revert_padding[1:])]
+        return predicted_logits
+
+    def predict_from_files_sequential(self,
+                           list_of_lists_or_source_folder: Union[str, List[List[str]]],
+                           output_folder_or_list_of_truncated_output_files: Union[str, None, List[str]],
+                           save_probabilities: bool = False,
+                           overwrite: bool = True,
+                           folder_with_segs_from_prev_stage: str = None):
+        """
+        Just like predict_from_files but doesn't use any multiprocessing. Slow, but sometimes necessary
+        """
+        if isinstance(output_folder_or_list_of_truncated_output_files, str):
+            output_folder = output_folder_or_list_of_truncated_output_files
+        elif isinstance(output_folder_or_list_of_truncated_output_files, list):
+            output_folder = os.path.dirname(output_folder_or_list_of_truncated_output_files[0])
+            if len(output_folder) == 0:  # just a file was given without a folder
+                output_folder = os.path.curdir
+        else:
+            output_folder = None
+
+        ########################
+        # let's store the input arguments so that its clear what was used to generate the prediction
+        if output_folder is not None:
+            my_init_kwargs = {}
+            for k in inspect.signature(self.predict_from_files_sequential).parameters.keys():
+                my_init_kwargs[k] = locals()[k]
+            my_init_kwargs = deepcopy(
+                my_init_kwargs)  # let's not unintentionally change anything in-place. Take this as a
+            recursive_fix_for_json_export(my_init_kwargs)
+            save_json(my_init_kwargs, join(output_folder, 'predict_from_raw_data_args.json'))
+
+            # we need these two if we want to do things with the predictions like for example apply postprocessing
+            save_json(self.dataset_json, join(output_folder, 'dataset.json'), sort_keys=False)
+            save_json(self.plans_manager.plans, join(output_folder, 'plans.json'), sort_keys=False)
+        #######################
+
+        # check if we need a prediction from the previous stage
+        if self.configuration_manager.previous_stage_name is not None:
+            assert folder_with_segs_from_prev_stage is not None, \
+                f'The requested configuration is a cascaded network. It requires the segmentations of the previous ' \
+                f'stage ({self.configuration_manager.previous_stage_name}) as input. Please provide the folder where' \
+                f' they are located via folder_with_segs_from_prev_stage'
+
+        # sort out input and output filenames
+        list_of_lists_or_source_folder, output_filename_truncated, seg_from_prev_stage_files = \
+            self._manage_input_and_output_lists(list_of_lists_or_source_folder,
+                                                output_folder_or_list_of_truncated_output_files,
+                                                folder_with_segs_from_prev_stage, overwrite, 0, 1,
+                                                save_probabilities)
+        if len(list_of_lists_or_source_folder) == 0:
+            return
+
+        label_manager = self.plans_manager.get_label_manager(self.dataset_json)
+        preprocessor = self.configuration_manager.preprocessor_class(verbose=self.verbose)
+
+        if output_filename_truncated is None:
+            output_filename_truncated = [None] * len(list_of_lists_or_source_folder)
+        if seg_from_prev_stage_files is None:
+            seg_from_prev_stage_files = [None] * len(seg_from_prev_stage_files)
+
+        ret = []
+        for li, of, sps in zip(list_of_lists_or_source_folder, output_filename_truncated, seg_from_prev_stage_files):
+            data, seg, data_properties = preprocessor.run_case(
+                li,
+                sps,
+                self.plans_manager,
+                self.configuration_manager,
+                self.dataset_json
+            )
+
+            print(f'perform_everything_on_device: {self.perform_everything_on_device}')
+            print("Shape of input data:", data.shape)
+
+            prediction = self.predict_logits_from_preprocessed_data(torch.from_numpy(data)).cpu()
+
+            # Use a deepcopy of the original data_properties for both exports
+            data_properties_for_export = deepcopy(data_properties)
+
+            # Always ensure 'spacing' is present and a list of floats, and store transposed version for downstream
+            if 'spacing' not in data_properties_for_export or not isinstance(data_properties_for_export['spacing'], list):
+                if 'original_spacing' in data_properties_for_export and isinstance(data_properties_for_export['original_spacing'], list):
+                    data_properties_for_export['spacing'] = [float(x) for x in data_properties_for_export['original_spacing']]
+                else:
+                    data_properties_for_export['spacing'] = [1.0, 1.0, 1.0]
+            else:
+                data_properties_for_export['spacing'] = [float(x) for x in data_properties_for_export['spacing']]
+
+            # Store the latest properties for use outside the loop if needed
+            self.latest_properties = deepcopy(data_properties_for_export)
+
+            if of is not None:
+                pred_path = of + self.dataset_json['file_ending']
+                print(f"✅ Saved prediction to: {pred_path}")
+                export_prediction_from_logits(prediction, data_properties_for_export, self.configuration_manager, self.plans_manager,
+                  self.dataset_json, of, save_probabilities)
+            else:
+                print(f"✅ Prediction returned for in-memory case (not saved to disk)")
+                ret.append(convert_predicted_logits_to_segmentation_with_correct_shape(prediction, self.plans_manager,
+                     self.configuration_manager, self.label_manager,
+                     data_properties_for_export,
+                     save_probabilities))
+
+            # --- Save uncertainty map using the same unmodified data_properties ---
+            if self.latest_uncertainty_map is not None:
+                print("[DEBUG] data_properties for uncertainty map:")
+                for k, v in data_properties_for_export.items():
+                    print(f"  {k}: {v if not isinstance(v, (np.ndarray, list, dict)) else type(v)}")
+                unc_output_path = None
+                if of is not None:
+                    unc_output_path = os.path.join(os.path.dirname(of), "uncertainty.nii.gz")
+                else:
+                    unc_output_path = "uncertainty.nii.gz"
+                unc_map = self.latest_uncertainty_map.cpu().numpy()
+                # Ensure 4D shape (C, X, Y, Z)
+                if unc_map.ndim == 3:
+                    unc_map = unc_map[None, ...]
+                elif unc_map.ndim != 4:
+                    raise ValueError(f"Uncertainty map must be 4D (C, X, Y, Z), got shape {unc_map.shape}")
+                save_uncertainty_map_remap(
+                    unc_map,
+                    data_properties_for_export,
+                    self.plans_manager,
+                    self.configuration_manager,
+                    unc_output_path,
+                    self.label_manager
+                )
+
+        # clear lru cache
+        compute_gaussian.cache_clear()
+        # clear device cache
+        empty_cache(self.device)
+        return ret
+
+def _getDefaultValue(env: str, dtype: type, default: any,) -> any:
+    try:
+        val = dtype(os.environ.get(env) or default)
+    except:
+        val = default
+    return val
+
+def predict_entry_point_modelfolder():
+    import argparse
+    parser = argparse.ArgumentParser(description='Use this to run inference with nnU-Net. This function is used when '
+                                                 'you want to manually specify a folder containing a trained nnU-Net '
+                                                 'model. This is useful when the nnunet environment variables '
+                                                 '(nnUNet_results) are not set.')
+    parser.add_argument('-i', type=str, required=True,
+                        help='input folder. Remember to use the correct channel numberings for your files (_0000 etc). '
+                             'File endings must be the same as the training dataset!')
+    parser.add_argument('-o', type=str, required=True,
+                        help='Output folder. If it does not exist it will be created. Predicted segmentations will '
+                             'have the same name as their source images.')
+    parser.add_argument('-m', type=str, required=True,
+                        help='Folder in which the trained model is. Must have subfolders fold_X for the different '
+                             'folds you trained')
+    parser.add_argument('-f', nargs='+', type=str, required=False, default=['0', '1', '2', '3', '4'],
+                        help='Specify the folds of the trained model that should be used for prediction. '
+                             'Use "all" to load a model trained on all data.')
+    parser.add_argument('-step_size', type=float, required=False, default=0.5,
+                        help='Step size for sliding window prediction. The larger it is the faster but less accurate '
+                             'the prediction. Default: 0.5. Cannot be larger than 1. We recommend the default.')
+    parser.add_argument('--disable_tta', action='store_true', required=False, default=False,
+                        help='Set this flag to disable test time data augmentation in the form of mirroring. Faster, '
+                             'but less accurate inference. Not recommended.')
+    parser.add_argument('--verbose', action='store_true', help="Set this if you like being talked to. You will have "
+                                                               "to be a good listener/reader.")
+    parser.add_argument('--save_probabilities', action='store_true',
+                        help='Set this to export predicted class "probabilities". Required if you want to ensemble '
+                             'multiple configurations.')
+    parser.add_argument('--continue_prediction', '--c', action='store_true',
+                        help='Continue an aborted previous prediction (will not overwrite existing files)')
+    parser.add_argument('-chk', type=str, required=False, default='checkpoint_final.pth',
+                        help='Name of the checkpoint you want to use. Default: checkpoint_final.pth')
+    parser.add_argument('-npp', type=int, required=False, default=3,
+                        help='Number of processes used for preprocessing. More is not always better. Beware of '
+                             'out-of-RAM issues. Default: 3')
+    parser.add_argument('-nps', type=int, required=False, default=3,
+                        help='Number of processes used for segmentation export. More is not always better. Beware of '
+                             'out-of-RAM issues. Default: 3')
+    parser.add_argument('-prev_stage_predictions', type=str, required=False, default=None,
+                        help='Folder containing the predictions of the previous stage. Required for cascaded models.')
+    parser.add_argument('-device', type=str, default='cuda', required=False,
+                        help="Use this to set the device the inference should run with. Available options are 'cuda' "
+                             "(GPU), 'cpu' (CPU) and 'mps' (Apple M1/M2). Do NOT use this to set which GPU ID! "
+                             "Use CUDA_VISIBLE_DEVICES=X nnUNetv2_predict [...] instead!")
+    parser.add_argument('--disable_progress_bar', action='store_true', required=False, default=False,
+                        help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
+                             'jobs)')
+
+    print(
+        "\n#######################################################################\nPlease cite the following paper "
+        "when using nnU-Net:\n"
+        "Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2021). "
+        "nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. "
+        "Nature methods, 18(2), 203-211.\n#######################################################################\n")
+
+    args = parser.parse_args()
+    args.f = [i if isinstance(i, str) and i.lower() == 'all' else int(i) for i in args.f]
+    print(f"Received folds: {args.f}")
+
+    if not isdir(args.o):
+        maybe_mkdir_p(args.o)
+
+    assert args.device in ['cpu', 'cuda',
+                           'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
+    if args.device == 'cpu':
+        # let's allow torch to use hella threads
+        import multiprocessing
+        torch.set_num_threads(multiprocessing.cpu_count())
+        device = torch.device('cpu')
+    elif args.device == 'cuda':
+        # multithreading in torch doesn't help nnU-Net if run on GPU
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+        device = torch.device('cuda')
+    else:
+        device = torch.device('mps')
+
+    predictor = nnUNetPredictor(tile_step_size=args.step_size,
+                                use_gaussian=True,
+                                use_mirroring=not args.disable_tta,
+                                perform_everything_on_device=True,
+                                device=device,
+                                verbose=args.verbose,
+                                allow_tqdm=not args.disable_progress_bar,
+                                verbose_preprocessing=args.verbose)
+    predictor.initialize_from_trained_model_folder(args.m, args.f, args.chk)
+    
+    # Enable MC dropout for uncertainty estimation
+    print("Enabling MC dropout for uncertainty estimation...")
+    enable_mc_dropout(predictor.network)
+    
+    # Use sequential prediction to enable MC dropout and uncertainty map generation
+    predictor.predict_from_files_sequential(args.i, args.o, save_probabilities=args.save_probabilities,
+                                           overwrite=not args.continue_prediction,
+                                           folder_with_segs_from_prev_stage=args.prev_stage_predictions)
+
+
+def predict_entry_point():
+    import argparse
+    parser = argparse.ArgumentParser(description='Use this to run inference with nnU-Net. This function is used when '
+                                                 'you want to manually specify a folder containing a trained nnU-Net '
+                                                 'model. This is useful when the nnunet environment variables '
+                                                 '(nnUNet_results) are not set.')
+    parser.add_argument('-i', type=str, required=True,
+                        help='input folder. Remember to use the correct channel numberings for your files (_0000 etc). '
+                             'File endings must be the same as the training dataset!')
+    parser.add_argument('-o', type=str, required=True,
+                        help='Output folder. If it does not exist it will be created. Predicted segmentations will '
+                             'have the same name as their source images.')
+    parser.add_argument('-d', type=str, required=True,
+                        help='Dataset with which you would like to predict. You can specify either dataset name or id')
+    parser.add_argument('-p', type=str, required=False, default='nnUNetPlans',
+                        help='Plans identifier. Specify the plans in which the desired configuration is located. '
+                             'Default: nnUNetPlans')
+    parser.add_argument('-tr', type=str, required=False, default='nnUNetTrainer',
+                        help='What nnU-Net trainer class was used for training? Default: nnUNetTrainer')
+    parser.add_argument('-c', type=str, required=True,
+                        help='nnU-Net configuration that should be used for prediction. Config must be located '
+                             'in the plans specified with -p')
+    parser.add_argument('-f', nargs='+', type=str, required=False, default=(0, 1, 2, 3, 4),
+                        help='Specify the folds of the trained model that should be used for prediction. '
+                             'Default: (0, 1, 2, 3, 4)')
+    parser.add_argument('-step_size', type=float, required=False, default=0.5,
+                        help='Step size for sliding window prediction. The larger it is the faster but less accurate '
+                             'the prediction. Default: 0.5. Cannot be larger than 1. We recommend the default.')
+    parser.add_argument('--disable_tta', action='store_true', required=False, default=False,
+                        help='Set this flag to disable test time data augmentation in the form of mirroring. Faster, '
+                             'but less accurate inference. Not recommended.')
+    parser.add_argument('--verbose', action='store_true', help="Set this if you like being talked to. You will have "
+                                                               "to be a good listener/reader.")
+    parser.add_argument('--save_probabilities', action='store_true',
+                        help='Set this to export predicted class "probabilities". Required if you want to ensemble '
+                             'multiple configurations.')
+    parser.add_argument('--continue_prediction', action='store_true',
+                        help='Continue an aborted previous prediction (will not overwrite existing files)')
+    parser.add_argument('-chk', type=str, required=False, default='checkpoint_final.pth',
+                        help='Name of the checkpoint you want to use. Default: checkpoint_final.pth')
+    parser.add_argument('-npp', type=int, required=False, default=_getDefaultValue('nnUNet_npp', int, 3),
+                        help='Number of processes used for preprocessing. More is not always better. Beware of '
+                             'out-of-RAM issues. Default: 3')
+    parser.add_argument('-nps', type=int, required=False, default=_getDefaultValue('nnUNet_nps', int, 3),
+                        help='Number of processes used for segmentation export. More is not always better. Beware of '
+                             'out-of-RAM issues. Default: 3')
+    parser.add_argument('-prev_stage_predictions', type=str, required=False, default=None,
+                        help='Folder containing the predictions of the previous stage. Required for cascaded models.')
+    parser.add_argument('-num_parts', type=int, required=False, default=1,
+                        help='Number of separate nnUNetv2_predict call that you will be making. Default: 1 (= this one '
+                             'call predicts everything)')
+    parser.add_argument('-part_id', type=int, required=False, default=0,
+                        help='If multiple nnUNetv2_predict exist, which one is this? IDs start with 0 can end with '
+                             'num_parts - 1. So when you submit 5 nnUNetv2_predict calls you need to set -num_parts '
+                             '5 and use -part_id 0, 1, 2, 3 and 4. Simple, right? Note: You are yourself responsible '
+                             'to make these run on separate GPUs! Use CUDA_VISIBLE_DEVICES (google, yo!)')
+    parser.add_argument('-device', type=str, default='cuda', required=False,
+                        help="Use this to set the device the inference should run with. Available options are 'cuda' "
+                             "(GPU), 'cpu' (CPU) and 'mps' (Apple M1/M2). Do NOT use this to set which GPU ID! "
+                             "Use CUDA_VISIBLE_DEVICES=X nnUNetv2_predict [...] instead!")
+    parser.add_argument('--disable_progress_bar', action='store_true', required=False, default=False,
+                        help='Set this flag to disable progress bar. Recommended for HPC environments (non interactive '
+                             'jobs)')
+
+    print(
+        "\n#######################################################################\nPlease cite the following paper "
+        "when using nnU-Net:\n"
+        "Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2021). "
+        "nnU-Net: a self-configuring method for deep learning-based biomedical image segmentation. "
+        "Nature methods, 18(2), 203-211.\n#######################################################################\n")
+
+    args = parser.parse_args()
+    args.f = [i if i == 'all' else int(i) for i in args.f]
+
+    model_folder = get_output_folder(args.d, args.tr, args.p, args.c)
+
+    if not isdir(args.o):
+        maybe_mkdir_p(args.o)
+
+    # slightly passive aggressive haha
+    assert args.part_id < args.num_parts, 'Do you even read the documentation? See nnUNetv2_predict -h.'
+
+    assert args.device in ['cpu', 'cuda',
+                           'mps'], f'-device must be either cpu, mps or cuda. Other devices are not tested/supported. Got: {args.device}.'
+    if args.device == 'cpu':
+        # let's allow torch to use hella threads
+        import multiprocessing
+        torch.set_num_threads(multiprocessing.cpu_count())
+        device = torch.device('cpu')
+    elif args.device == 'cuda':
+        # multithreading in torch doesn't help nnU-Net if run on GPU
+        torch.set_num_threads(1)
+        torch.set_num_interop_threads(1)
+        device = torch.device('cuda')
+    else:
+        device = torch.device('mps')
+
+    predictor = nnUNetPredictor(tile_step_size=args.step_size,
+                                use_gaussian=True,
+                                use_mirroring=not args.disable_tta,
+                                perform_everything_on_device=True,
+                                device=device,
+                                verbose=args.verbose,
+                                verbose_preprocessing=args.verbose,
+                                allow_tqdm=not args.disable_progress_bar)
+    predictor.initialize_from_trained_model_folder(
+        model_folder,
+        args.f,
+        checkpoint_name=args.chk
+    )
+    
+    run_sequential = args.nps == 0 and args.npp == 0
+    
+    if run_sequential:
+        
+        print("Running in non-multiprocessing mode")
+        predictor.predict_from_files_sequential(args.i, args.o, save_probabilities=args.save_probabilities,
+                                                overwrite=not args.continue_prediction,
+                                                folder_with_segs_from_prev_stage=args.prev_stage_predictions)
+    
+    else:
+        
+        predictor.predict_from_files(args.i, args.o, save_probabilities=args.save_probabilities,
+                                    overwrite=not args.continue_prediction,
+                                    num_processes_preprocessing=args.npp,
+                                    num_processes_segmentation_export=args.nps,
+                                    folder_with_segs_from_prev_stage=args.prev_stage_predictions,
+                                    num_parts=args.num_parts,
+                                    part_id=args.part_id)
+    
+    # r = predict_from_raw_data(args.i,
+    #                           args.o,
+    #                           model_folder,
+    #                           args.f,
+    #                           args.step_size,
+    #                           use_gaussian=True,
+    #                           use_mirroring=not args.disable_tta,
+    #                           perform_everything_on_device=True,
+    #                           verbose=args.verbose,
+    #                           save_probabilities=args.save_probabilities,
+    #                           overwrite=not args.continue_prediction,
+    #                           checkpoint_name=args.chk,
+    #                           num_processes_preprocessing=args.npp,
+    #                           num_processes_segmentation_export=args.nps,
+    #                           folder_with_segs_from_prev_stage=args.prev_stage_predictions,
+    #                           num_parts=args.num_parts,
+    #                           part_id=args.part_id,
+    #                           device=device)
+
+def enable_dropout(model):
+    for m in model.modules():
+        if isinstance(m, torch.nn.Dropout):
+            m.train()
+
+
+if __name__ == '__main__':
+    ########################## predict a bunch of files
+    from nnunetv2.paths import nnUNet_results, nnUNet_raw
+
+    predictor = nnUNetPredictor(
+        tile_step_size=0.5,
+        use_gaussian=True,
+        use_mirroring=True,
+        perform_everything_on_device=True,
+        device=torch.device('cuda', 0),
+        verbose=False,
+        verbose_preprocessing=False,
+        allow_tqdm=True
+    )
+    predictor.initialize_from_trained_model_folder(
+        join(nnUNet_results, 'Dataset999_BraTSPED/nnUNetTrainer__nnUNetPlans__3d_fullres'),
+        use_folds=(0,),
+        checkpoint_name='checkpoint_final.pth',
+    )
+    enable_dropout(predictor.network)
+    
+    # predictor.predict_from_files(join(nnUNet_raw, 'Dataset003_Liver/imagesTs'),
+    #                              join(nnUNet_raw, 'Dataset003_Liver/imagesTs_predlowres'),
+    #                              save_probabilities=False, overwrite=False,
+    #                              num_processes_preprocessing=2, num_processes_segmentation_export=2,
+    #                              folder_with_segs_from_prev_stage=None, num_parts=1, part_id=0)
+    #
+    # # predict a numpy array
+    # from nnunetv2.imageio.simpleitk_reader_writer import SimpleITKIO
+    #
+    # img, props = SimpleITKIO().read_images([join(nnUNet_raw, 'Dataset003_Liver/imagesTr/liver_63_0000.nii.gz')])
+    # ret = predictor.predict_single_npy_array(img, props, None, None, False)
+    #
+    # iterator = predictor.get_data_iterator_from_raw_npy_data([img], None, [props], None, 1)
+    # ret = predictor.predict_from_data_iterator(iterator, False, 1)
+
+    ret = predictor.predict_from_files_sequential(
+        [[
+            '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0000.nii.gz',
+            '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0001.nii.gz',
+            '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0002.nii.gz',
+            '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0003.nii.gz'
+        ]],
+        ['/home/hpl14/temp/predictions'],  # Destination folder
+        True,  # Save_probabilities
+        True,   # Overwrite existing
+        None    # Use default preprocessing
+    )
+    
+
+
+    def postprocess_uncertainty_map(uncertainty_map, properties, plans_manager, configuration_manager):
+        """
+        Postprocess the uncertainty map to match the original image shape and orientation.
+        """
+        import numpy as np
+        from nnunetv2.utilities.label_handling.label_handling import insert_crop_into_image
+
+        # Ensure uncertainty_map is 4D (C, X, Y, Z)
+        if uncertainty_map.ndim == 3:
+            uncertainty_map = uncertainty_map[None, ...]
+        elif uncertainty_map.ndim != 4:
+            raise ValueError(f"Uncertainty map must be 4D (C, X, Y, Z), got shape {uncertainty_map.shape}")
+
+        # Step 1: Resample to pre-cropped shape
+        spacing_transposed = [properties['spacing'][i] for i in plans_manager.transpose_forward]
+        current_spacing = configuration_manager.spacing if \
+            len(configuration_manager.spacing) == len(properties['shape_after_cropping_and_before_resampling']) else \
+            [spacing_transposed[0], *configuration_manager.spacing]
+        resampled = configuration_manager.resampling_fn_probabilities(
+            uncertainty_map,  # pass as-is, already 4D
+            properties['shape_after_cropping_and_before_resampling'],
+            current_spacing,
+            [properties['spacing'][i] for i in plans_manager.transpose_forward]
+        )[0]  # remove channel dim if needed
+
+        # Step 2: Uncrop (insert into original shape)
+        uncropped = np.zeros(properties['shape_before_cropping'], dtype=resampled.dtype)
+        uncropped = insert_crop_into_image(uncropped, resampled, properties['bbox_used_for_cropping'])
+
+        # Step 3: Transpose back to original orientation
+        uncropped = uncropped.transpose(plans_manager.transpose_backward)
+        return uncropped
+
+    # Get properties for the case (from the last prediction)
+    properties = None
+    if hasattr(predictor, 'latest_properties'):
+        properties = predictor.latest_properties
+    else:
+        # Try to get from the last run_case in predict_from_files_sequential
+        # This is a fallback: you may need to adapt this to your workflow
+        import glob, json, os
+        pred_dir = "/home/hpl14/temp/predictions"
+        json_files = sorted(glob.glob(os.path.join(pred_dir, '*.json')))
+        if json_files:
+            with open(json_files[-1], 'r') as f:
+                properties = json.load(f)
+
+    if predictor.latest_uncertainty_map is not None and properties is not None:
+        unc_map = predictor.latest_uncertainty_map.cpu().numpy()
+        unc_map_post = postprocess_uncertainty_map(
+            unc_map,
+            properties,
+            predictor.plans_manager,
+            predictor.configuration_manager
+        )
+        
+        # CRITICAL FIX: Ensure the properties contain the correct path to the original image
+        # Use the FLAIR image (channel 0, _0000 file) for affine matrix reference
+        # All modalities should have the same affine matrix since they're co-registered
+        if 'path' not in properties or properties['path'] is None:
+            # Use the FLAIR image from the prediction call above
+            input_files = [
+                '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0000.nii.gz',  # FLAIR (channel 0)
+                '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0001.nii.gz',  # T1 (channel 1)
+                '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0002.nii.gz',  # T1CE (channel 2)
+                '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0003.nii.gz'   # T2 (channel 3)
+            ]
+            # Use the FLAIR image (first file, _0000) as reference
+            original_image_path = input_files[0]  # FLAIR (_0000)
+            properties['path'] = original_image_path
+            print(f"[DEBUG] Set properties['path'] to FLAIR image: {original_image_path}")
+        
+        save_uncertainty_map_remap(
+            unc_map_post,
+            properties,
+            predictor.plans_manager,
+            predictor.configuration_manager,
+            output_path=os.path.join("/home/hpl14/MC_predictions/BraTS-PED-00062/", "uncertainty.nii.gz"),
+            label_manager=getattr(predictor, 'label_manager', None)
+        )
+    else:
+        print("No uncertainty map or properties available!")
+                                  
