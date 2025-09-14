@@ -140,8 +140,7 @@ def save_uncertainty_map_remap(uncertainty: np.ndarray, properties: dict, plans_
     if uncropped.shape[0] == 1:
         uncropped = uncropped[0]
 
-    # CRITICAL: Apply the same transpose operations that nnU-Net uses for predictions
-    # This ensures the uncertainty map has the same orientation as the prediction
+    # Apply the same transpose operations that nnU-Net uses for predictions
     print(f"[DEBUG] Uncertainty shape before transpose: {uncropped.shape}")
     
     # Use nnU-Net's transpose_backward to convert from processing space to original space
@@ -160,7 +159,7 @@ def save_uncertainty_map_remap(uncertainty: np.ndarray, properties: dict, plans_
         else:
             print("[WARNING] Could not find transpose_backward anywhere, skipping nnU-Net transpose")
 
-    # CRITICAL: Check if we need additional transpose to match original image orientation
+    # Check if we need additional transpose to match original image orientation
     if 'path' in properties and properties['path'] is not None:
         try:
             original_nii = nib.load(properties['path'])
@@ -195,14 +194,14 @@ def save_uncertainty_map_remap(uncertainty: np.ndarray, properties: dict, plans_
 
     import nibabel as nib
     
-    # CRITICAL: Use the original image's affine and header to preserve orientation
+    # Use the original image's affine and header to preserve orientation
     if 'path' in properties and properties['path'] is not None:
         try:
             print(f"[DEBUG] Attempting to load original image from: {properties['path']}")
             original_nii = nib.load(properties['path'])
             affine = original_nii.affine.copy()
             header = original_nii.header.copy()
-            print(f"[DEBUG] ✅ Successfully loaded original image affine from: {properties['path']}")
+            print(f"[DEBUG] Successfully loaded original image affine from: {properties['path']}")
             print(f"[DEBUG] Original affine:\n{affine}")
         except Exception as e:
             print(f"[ERROR] Failed to load original image from {properties['path']}: {e}")
@@ -1383,17 +1382,16 @@ if __name__ == '__main__':
     # iterator = predictor.get_data_iterator_from_raw_npy_data([img], None, [props], None, 1)
     # ret = predictor.predict_from_data_iterator(iterator, False, 1)
 
+    # Batch inference for all test cases in imagesTs
+    imagesTs_dir = '/scratch/hpl14/nnunet_v2_valerie/raw/Dataset777_BraTSPED2024/imagesTs'
+    output_dir = '/scratch/hpl14/nnunet_v2_valerie/inference/777_mcdo_predictions/'
+
     ret = predictor.predict_from_files_sequential(
-        [[
-            '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0000.nii.gz',
-            '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0001.nii.gz',
-            '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0002.nii.gz',
-            '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0003.nii.gz'
-        ]],
-        ['/home/hpl14/temp/predictions'],  # Destination folder
-        True,  # Save_probabilities
-        True,   # Overwrite existing
-        None    # Use default preprocessing
+        imagesTs_dir,      # input: directory with all test images
+        output_dir,        # output: directory for all predictions
+        save_probabilities=True,
+        overwrite=True,
+        folder_with_segs_from_prev_stage=None
     )
     
 
@@ -1437,7 +1435,6 @@ if __name__ == '__main__':
         properties = predictor.latest_properties
     else:
         # Try to get from the last run_case in predict_from_files_sequential
-        # This is a fallback: you may need to adapt this to your workflow
         import glob, json, os
         pred_dir = "/home/hpl14/temp/predictions"
         json_files = sorted(glob.glob(os.path.join(pred_dir, '*.json')))
@@ -1454,28 +1451,41 @@ if __name__ == '__main__':
             predictor.configuration_manager
         )
         
-        # CRITICAL FIX: Ensure the properties contain the correct path to the original image
-        # Use the FLAIR image (channel 0, _0000 file) for affine matrix reference
-        # All modalities should have the same affine matrix since they're co-registered
+        # Generalize: set properties['path'] to the FLAIR image (_0000) for the current case if not already set
+        # and set output path to the correct output directory for the current case
         if 'path' not in properties or properties['path'] is None:
-            # Use the FLAIR image from the prediction call above
-            input_files = [
-                '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0000.nii.gz',  # FLAIR (channel 0)
-                '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0001.nii.gz',  # T1 (channel 1)
-                '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0002.nii.gz',  # T1CE (channel 2)
-                '/scratch/hpl14/nnUNet_raw/Dataset999_BraTSPED/imagesTs/BraTS-PED-00062-0003.nii.gz'   # T2 (channel 3)
-            ]
-            # Use the FLAIR image (first file, _0000) as reference
-            original_image_path = input_files[0]  # FLAIR (_0000)
-            properties['path'] = original_image_path
-            print(f"[DEBUG] Set properties['path'] to FLAIR image: {original_image_path}")
-        
+            # Try to infer the FLAIR image from the input files for this case
+            # If input_files is available in scope, use it; otherwise, try to get from properties
+            input_files = properties.get('input_files', None)
+            if input_files is None:
+                # Try to find a file ending with _0000.nii or _0000.nii.gz in the same directory as the case
+                import glob, os
+                case_dir = os.path.dirname(properties.get('case_file', ''))
+                flair_candidates = glob.glob(os.path.join(case_dir, '*_0000.nii*'))
+                if flair_candidates:
+                    original_image_path = flair_candidates[0]
+                else:
+                    original_image_path = None
+            else:
+                original_image_path = input_files[0] if len(input_files) > 0 else None
+            if original_image_path is not None:
+                properties['path'] = original_image_path
+                print(f"[DEBUG] Set properties['path'] to FLAIR image: {original_image_path}")
+            else:
+                print("[WARNING] Could not determine FLAIR image for properties['path']!")
+
+        # Set output path for uncertainty map to the same directory as the prediction
+        # If 'output_dir' or 'prediction_dir' is in properties, use it; else fallback to current directory
+        import os
+        output_dir = properties.get('output_dir', os.getcwd())
+        output_path = os.path.join(output_dir, "uncertainty.nii.gz")
+
         save_uncertainty_map_remap(
             unc_map_post,
             properties,
             predictor.plans_manager,
             predictor.configuration_manager,
-            output_path=os.path.join("/home/hpl14/MC_predictions/BraTS-PED-00062/", "uncertainty.nii.gz"),
+            output_path=output_path,
             label_manager=getattr(predictor, 'label_manager', None)
         )
     else:
