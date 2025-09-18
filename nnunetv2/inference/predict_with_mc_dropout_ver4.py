@@ -774,15 +774,17 @@ class nnUNetPredictor(object):
                 if self.verbose and mc_pass % 5 == 0:
                     print(f'MC dropout pass {mc_pass + 1}/{num_mc_passes}')
                 
+                # Only show the progress bar for the first MC pass to avoid repeated tqdm instances
+                show_progress = (mc_pass == 0 and self.allow_tqdm)
                 if self.perform_everything_on_device and self.device != 'cpu':
                     try:
-                        pred_logits = self._internal_predict_sliding_window_return_logits(data, slicers, self.perform_everything_on_device)
+                        pred_logits = self._internal_predict_sliding_window_return_logits(data, slicers, self.perform_everything_on_device, use_tqdm=show_progress)
                     except RuntimeError:
                         print('Prediction on device was unsuccessful, probably due to a lack of memory. Moving results arrays to CPU')
                         empty_cache(self.device)
-                        pred_logits = self._internal_predict_sliding_window_return_logits(data, slicers, False)
+                        pred_logits = self._internal_predict_sliding_window_return_logits(data, slicers, False, use_tqdm=show_progress)
                 else:
-                    pred_logits = self._internal_predict_sliding_window_return_logits(data, slicers, self.perform_everything_on_device)
+                    pred_logits = self._internal_predict_sliding_window_return_logits(data, slicers, self.perform_everything_on_device, use_tqdm=show_progress)
                 
                 mc_predictions.append(pred_logits.unsqueeze(0))  # Add MC dimension
             
@@ -873,6 +875,7 @@ class nnUNetPredictor(object):
                                                        data: torch.Tensor,
                                                        slicers,
                                                        do_on_device: bool = True,
+                                                       use_tqdm: Optional[bool] = None,
                                                        ):
         predicted_logits = n_predictions = prediction = gaussian = workon = None
         results_device = self.device if do_on_device else torch.device('cpu')
@@ -908,10 +911,12 @@ class nnUNetPredictor(object):
             else:
                 gaussian = 1
 
-            if not self.allow_tqdm and self.verbose:
+            # Determine whether to show tqdm for this call. If use_tqdm is None, fall back to the object's setting.
+            effective_tqdm = self.allow_tqdm if use_tqdm is None else use_tqdm
+            if not effective_tqdm and self.verbose:
                 print(f'running prediction: {len(slicers)} steps')
 
-            with tqdm(desc=None, total=len(slicers), disable=not self.allow_tqdm) as pbar:
+            with tqdm(desc=None, total=len(slicers), disable=not effective_tqdm) as pbar:
                 while True:
                     item = queue.get()
                     if item == 'end':
