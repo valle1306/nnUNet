@@ -73,6 +73,19 @@ def save_uncertainty_map_remap(uncertainty: np.ndarray, properties: dict, plans_
     else:
         spacing_val = [1.0, 1.0, 1.0]
     properties['spacing'] = spacing_val
+    # Normalize alternate preprocessing property names to the ones expected below
+    # Some preprocessing outputs use different keys (e.g., 'bbox_used_for_cropping',
+    # 'shape_before_cropping', 'shape_after_cropping_and_before_resampling').
+    # Map them to the names used in this remapping function so we are robust.
+    if 'crop_bbox' not in properties and 'bbox_used_for_cropping' in properties:
+        properties['crop_bbox'] = properties['bbox_used_for_cropping']
+    if 'size_before_cropping' not in properties and 'shape_before_cropping' in properties:
+        properties['size_before_cropping'] = properties['shape_before_cropping']
+    if 'size_after_cropping' not in properties and 'shape_after_cropping_and_before_resampling' in properties:
+        properties['size_after_cropping'] = properties['shape_after_cropping_and_before_resampling']
+    # Also accept alternative bbox key name
+    if 'crop_bbox' not in properties and 'bbox_used_for_cropping' in properties:
+        properties['crop_bbox'] = properties['bbox_used_for_cropping']
     # The spacing has already been handled above, no need for additional processing
     """
     Remap and save the uncertainty map to the original image space using nnU-Net's remapping pipeline.
@@ -215,12 +228,35 @@ def save_uncertainty_map_remap(uncertainty: np.ndarray, properties: dict, plans_
         print(f"[WARNING] No original image path found in properties: {properties.keys()}")
         print("[WARNING] Using identity affine")
     
+    # --- Ensure unique output filename per subject ---
+    import os
+    # Try to extract case ID from properties['path'] or output_path
+    case_id = None
+    if 'path' in properties and properties['path']:
+        # Remove extension and directory, get base name
+        case_id = os.path.basename(properties['path'])
+        # Remove .nii or .nii.gz
+        if case_id.endswith('.nii.gz'):
+            case_id = case_id[:-7]
+        elif case_id.endswith('.nii'):
+            case_id = case_id[:-4]
+    else:
+        # Fallback: try to get from output_path
+        case_id = os.path.basename(output_path)
+        if case_id.endswith('.nii.gz'):
+            case_id = case_id[:-7]
+        elif case_id.endswith('.nii'):
+            case_id = case_id[:-4]
+    # Compose new output filename
+    uncertainty_filename = f"{case_id}_uncertainty.nii.gz"
+    output_dir = os.path.dirname(output_path)
+    output_path_unique = os.path.join(output_dir, uncertainty_filename)
     # Save uncertainty map with correct affine/header
     uncertainty_nii = nib.Nifti1Image(uncropped, affine, header)
-    nib.save(uncertainty_nii, output_path)
-    print(f"✅ Saved remapped uncertainty map to: {output_path}")
+    nib.save(uncertainty_nii, output_path_unique)
+    print(f"✅ Saved remapped uncertainty map to: {output_path_unique}")
     print(f"[DEBUG] Saved uncertainty shape: {uncropped.shape}")
-    print(f"[DEBUG] Saved uncertainty affine:\n{affine}")                                                                                    
+    print(f"[DEBUG] Saved uncertainty affine:\n{affine}")
 
 
 
@@ -1023,13 +1059,47 @@ class nnUNetPredictor(object):
                 self.dataset_json
             )
 
-            print(f'perform_everything_on_device: {self.perform_everything_on_device}')
-            print("Shape of input data:", data.shape)
+            # Compact per-case logging: derive a short case_id from inputs (li) or output filename (of)
+            try:
+                case_id = None
+                if isinstance(li, (list, tuple)) and len(li) > 0:
+                    candidate = next((p for p in li if isinstance(p, str)), None)
+                    if candidate:
+                        case_id = os.path.basename(candidate)
+                if case_id is None and of is not None:
+                    case_id = os.path.basename(of)
+                if case_id is None:
+                    case_id = 'case'
+                if case_id.endswith('.nii.gz'):
+                    case_id = case_id[:-7]
+                elif case_id.endswith('.nii'):
+                    case_id = case_id[:-4]
+            except Exception:
+                case_id = 'case'
+            print(f"[INFO] Processing case: {case_id}")
 
             prediction = self.predict_logits_from_preprocessed_data(torch.from_numpy(data)).cpu()
 
             # Use a deepcopy of the original data_properties for both exports
             data_properties_for_export = deepcopy(data_properties)
+
+            # Ensure the original image path is present so downstream remapping/saving can
+            # load affine/header and create a unique per-case output filename.
+            # 'li' is the list of input file paths for this case; use the first channel (_0000) when available.
+            try:
+                if isinstance(li, (list, tuple)) and len(li) > 0:
+                    # Prefer the _0000 channel (commonly FLAIR / first channel) when available
+                    flair_candidates = [p for p in li if isinstance(p, str) and (p.endswith('_0000.nii') or p.endswith('_0000.nii.gz'))]
+                    if len(flair_candidates) > 0:
+                        data_properties_for_export['path'] = flair_candidates[0]
+                    else:
+                        # fallback to the first filename that looks like a path
+                        first_str = next((p for p in li if isinstance(p, str)), None)
+                        data_properties_for_export['path'] = first_str
+                else:
+                    data_properties_for_export['path'] = data_properties.get('path', None)
+            except Exception:
+                data_properties_for_export['path'] = data_properties.get('path', None)
 
             # Always ensure 'spacing' is present and a list of floats, and store transposed version for downstream
             if 'spacing' not in data_properties_for_export or not isinstance(data_properties_for_export['spacing'], list):
@@ -1045,26 +1115,40 @@ class nnUNetPredictor(object):
 
             if of is not None:
                 pred_path = of + self.dataset_json['file_ending']
-                print(f"✅ Saved prediction to: {pred_path}")
                 export_prediction_from_logits(prediction, data_properties_for_export, self.configuration_manager, self.plans_manager,
-                  self.dataset_json, of, save_probabilities)
+                self.dataset_json, of, save_probabilities)
+                pred_log = pred_path
             else:
-                print(f"✅ Prediction returned for in-memory case (not saved to disk)")
                 ret.append(convert_predicted_logits_to_segmentation_with_correct_shape(prediction, self.plans_manager,
-                     self.configuration_manager, self.label_manager,
-                     data_properties_for_export,
-                     save_probabilities))
+                self.configuration_manager, self.label_manager,
+                data_properties_for_export,
+                save_probabilities))
+                pred_log = 'in-memory'
 
             # --- Save uncertainty map using the same unmodified data_properties ---
+            # prepare concise logs for prediction and uncertainty
+            unc_log = None
             if self.latest_uncertainty_map is not None:
-                print("[DEBUG] data_properties for uncertainty map:")
-                for k, v in data_properties_for_export.items():
-                    print(f"  {k}: {v if not isinstance(v, (np.ndarray, list, dict)) else type(v)}")
-                unc_output_path = None
+                # Determine a unique uncertainty output path per case to avoid overwrites.
                 if of is not None:
-                    unc_output_path = os.path.join(os.path.dirname(of), "uncertainty.nii.gz")
+                    out_dir = os.path.dirname(of)
+                    if len(out_dir) == 0:
+                        out_dir = os.getcwd()
                 else:
-                    unc_output_path = "uncertainty.nii.gz"
+                    out_dir = output_folder if output_folder is not None else os.getcwd()
+
+                # Derive case id from properties path if available
+                case_id_from_props = None
+                pth = data_properties_for_export.get('path', None)
+                if pth:
+                    case_id_from_props = os.path.basename(pth)
+                    if case_id_from_props.endswith('.nii.gz'):
+                        case_id_from_props = case_id_from_props[:-7]
+                    elif case_id_from_props.endswith('.nii'):
+                        case_id_from_props = case_id_from_props[:-4]
+                # fallback to earlier case_id or input list
+                chosen_case_id = case_id_from_props or case_id
+                unc_output_path = os.path.join(out_dir, f"{chosen_case_id}_uncertainty.nii.gz")
                 unc_map = self.latest_uncertainty_map.cpu().numpy()
                 # Ensure 4D shape (C, X, Y, Z)
                 if unc_map.ndim == 3:
@@ -1079,6 +1163,13 @@ class nnUNetPredictor(object):
                     unc_output_path,
                     self.label_manager
                 )
+                unc_log = unc_output_path
+
+            # Single concise summary print per case
+            summary = [f"prediction={pred_log}"]
+            if unc_log is not None:
+                summary.append(f"uncertainty={unc_log}")
+            print(f"[INFO] Done {case_id} -> {', '.join(summary)}")
 
         # clear lru cache
         compute_gaussian.cache_clear()
@@ -1361,8 +1452,8 @@ if __name__ == '__main__':
         allow_tqdm=True
     )
     predictor.initialize_from_trained_model_folder(
-        join(nnUNet_results, 'Dataset999_BraTSPED/nnUNetTrainer__nnUNetPlans__3d_fullres'),
-        use_folds=(0,),
+        join(nnUNet_results, 'Dataset777_BraTSPED2024/nnUNetTrainer__nnUNetPlans__3d_fullres'),
+        use_folds=(0, 1, 2, 3, 4),
         checkpoint_name='checkpoint_final.pth',
     )
     enable_dropout(predictor.network)
