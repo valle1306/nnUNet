@@ -114,3 +114,27 @@ ENV/
 *.model
 
 !documentation/assets/scribble_example.png
+
+# ------ nnUNet / user data & large outputs (do NOT commit) ------
+# Raw/preprocessed datasets and generated results
+nnUNet_raw_data/
+nnUNet_preprocessed/
+nnUNet_results/
+raw/
+preprocessed/
+results/
+
+# Prediction outputs, ensemble/probability maps, MC-dropout outputs
+preds_*
+*_preds_*
+mc_dropout_*
+
+# Logs, scratch and temporary compute outputs
+logs/
+scratch/
+
+# Medical image files (often large) - uncomment if you never want these in git
+*.nii.gz
+*.mha
+
+# End nnUNet-specific ignores
