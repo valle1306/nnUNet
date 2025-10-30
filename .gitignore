@@ -137,4 +137,4 @@ scratch/
 *.nii.gz
 *.mha
 
-# End nnUNet-specific ignores
+# End nnUNet-specific ignoresnnunetv2/inference/obsolete_backup_*
