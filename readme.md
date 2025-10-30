@@ -29,116 +29,159 @@ Upon release, nnU-Net was evaluated on 23 datasets belonging to competitions fro
 with handcrafted solutions for each respective dataset, nnU-Net's fully automated pipeline scored several first places on 
 open leaderboards! Since then nnU-Net has stood the test of time: it continues to be used as a baseline and method 
 development framework ([9 out of 10 challenge winners at MICCAI 2020](https://arxiv.org/abs/2101.00232) and 5 out of 7 
-in MICCAI 2021 built their methods on top of nnU-Net, 
- [we won AMOS2022 with nnU-Net](https://amos22.grand-challenge.org/final-ranking/))!
+# MC-Dropout nnU‑Net — Reproduction & Usage
 
-Please cite the [following paper](https://www.google.com/url?q=https://www.nature.com/articles/s41592-020-01008-z&sa=D&source=docs&ust=1677235958581755&usg=AOvVaw3dWL0SrITLhCJUBiNIHCQO) when using nnU-Net:
+This repository is an nnU‑Net v2 codebase extended to support Monte Carlo dropout (MC‑Dropout) inference, evaluation, and visualization used in our experiments. The document below explains the minimal, reproducible steps to go from raw data to uncertainty visualizations and metrics. It lists the key files that were edited/added and provides exact commands you can run on a cluster or a workstation.
 
-    Isensee, F., Jaeger, P. F., Kohl, S. A., Petersen, J., & Maier-Hein, K. H. (2021). nnU-Net: a self-configuring 
-    method for deep learning-based biomedical image segmentation. Nature methods, 18(2), 203-211.
+## Quick summary
+- Purpose: add MC‑Dropout inference and uncertainty export on top of nnU‑Net v2.
+- Key changes: edited full‑res plans to add dropout (≈0.2), added MC‑Dropout inference predictor, evaluation and visualization scripts (visualization uses rotation fix (2,1,0)).
+- Canonical files to use in this repo: `nnunetv2/inference/predict_with_mc_dropout_edited.py`, `run_mc_dropout_inference.py`, `nnunetv2/visualization/visualize_seg_and_uncertainty.py`.
 
+If you only want a one‑line recommendation: follow the steps in "Reproducible steps" below in order.
 
-## What can nnU-Net do for you?
-If you are a **domain scientist** (biologist, radiologist, ...) looking to analyze your own images, nnU-Net provides 
-an out-of-the-box solution that is all but guaranteed to provide excellent results on your individual dataset. Simply 
-convert your dataset into the nnU-Net format and enjoy the power of AI - no expertise required!
+## Prerequisites
+1. Clone repository and install in editable mode:
 
-If you are an **AI researcher** developing segmentation methods, nnU-Net:
-- offers a fantastic out-of-the-box applicable baseline algorithm to compete against
-- can act as a method development framework to test your contribution on a large number of datasets without having to 
-tune individual pipelines (for example evaluating a new loss function)
-- provides a strong starting point for further dataset-specific optimizations. This is particularly used when competing 
-in segmentation challenges
-- provides a new perspective on the design of segmentation methods: maybe you can find better connections between 
-dataset properties and best-fitting segmentation pipelines?
+```bash
+git clone <this-repo-url>
+cd <repo>
+pip install -e .
+```
 
-## What is the scope of nnU-Net?
-nnU-Net is built for semantic segmentation. It can handle 2D and 3D images with arbitrary 
-input modalities/channels. It can understand voxel spacings, anisotropies and is robust even when classes are highly
-imbalanced.
+2. Set nnU‑Net environment variables (example):
 
-nnU-Net relies on supervised learning, which means that you need to provide training cases for your application. The number of 
-required training cases varies heavily depending on the complexity of the segmentation problem. No 
-one-fits-all number can be provided here! nnU-Net does not require more training cases than other solutions - maybe 
-even less due to our extensive use of data augmentation. 
+```bash
+export nnUNet_raw='/path/to/nnUNet_raw'
+export nnUNet_preprocessed='/path/to/nnUNet_preprocessed'
+export nnUNet_results='/path/to/nnUNet_results'
+```
 
-nnU-Net expects to be able to process entire images at once during preprocessing and postprocessing, so it cannot 
-handle enormous images. As a reference: we tested images from 40x40x40 pixels all the way up to 1500x1500x1500 in 3D 
-and 40x40 up to ~30000x30000 in 2D! If your RAM allows it, larger is always possible.
+3. Create and activate a Python environment with required packages (example):
 
-## How does nnU-Net work?
-Given a new dataset, nnU-Net will systematically analyze the provided training cases and create a 'dataset fingerprint'. 
-nnU-Net then creates several U-Net configurations for each dataset: 
-- `2d`: a 2D U-Net (for 2D and 3D datasets)
-- `3d_fullres`: a 3D U-Net that operates on a high image resolution (for 3D datasets only)
-- `3d_lowres` → `3d_cascade_fullres`: a 3D U-Net cascade where first a 3D U-Net operates on low resolution images and 
-then a second high-resolution 3D U-Net refined the predictions of the former (for 3D datasets with large image sizes only)
+```bash
+conda create -n nnunetv2 python=3.10
+conda activate nnunetv2
+pip install -r requirements.txt  # if present, otherwise ensure nibabel, numpy, matplotlib, scipy
+pip install -e .
+```
 
-**Note that not all U-Net configurations are created for all datasets. In datasets with small image sizes, the 
-U-Net cascade (and with it the 3d_lowres configuration) is omitted because the patch size of the full 
-resolution U-Net already covers a large part of the input images.**
+## Reproducible steps
 
-nnU-Net configures its segmentation pipelines based on a three-step recipe:
-- **Fixed parameters** are not adapted. During development of nnU-Net we identified a robust configuration (that is, certain architecture and training properties) that can 
-simply be used all the time. This includes, for example, nnU-Net's loss function, (most of the) data augmentation strategy and learning rate.
-- **Rule-based parameters** use the dataset fingerprint to adapt certain segmentation pipeline properties by following 
-hard-coded heuristic rules. For example, the network topology (pooling behavior and depth of the network architecture) 
-are adapted to the patch size; the patch size, network topology and batch size are optimized jointly given some GPU 
-memory constraint. 
-- **Empirical parameters** are essentially trial-and-error. For example the selection of the best U-net configuration 
-for the given dataset (2D, 3D full resolution, 3D low resolution, 3D cascade) and the optimization of the postprocessing strategy.
+1) Preprocess dataset (nnU‑Net standard)
 
-## How to get started?
-Read these:
-- [Installation instructions](documentation/installation_instructions.md)
-- [Dataset conversion](documentation/dataset_format.md)
-- [Usage instructions](documentation/how_to_use_nnunet.md)
+Follow the repository documentation: `documentation/how_to_use_nnunet.md` and `documentation/dataset_format.md` to convert your dataset into nnU‑Net format and run preprocessing. After preprocessing, locate the generated plans JSON file for the full‑resolution configuration (look in the preprocessed output folder under `plans*.json`).
 
-Additional information:
-- [Learning from sparse annotations (scribbles, slices)](documentation/ignore_label.md)
-- [Region-based training](documentation/region_based_training.md)
-- [Manual data splits](documentation/manual_data_splits.md)
-- [Pretraining and finetuning](documentation/pretraining_and_finetuning.md)
-- [Intensity Normalization in nnU-Net](documentation/explanation_normalization.md)
-- [Manually editing nnU-Net configurations](documentation/explanation_plans_files.md)
-- [Extending nnU-Net](documentation/extending_nnunet.md)
-- [What is different in V2?](documentation/changelog.md)
+2) Edit the full‑resolution plans JSON (manual change you performed)
 
-Competitions:
-- [AutoPET II](documentation/competitions/AutoPETII.md)
+- Open the full‑res plans JSON (example path under `nnUNet_preprocessed/.../plans_3d_fullres.json`).
+- Locate encoder blocks where dropout probability is defined (may appear under `residual_blocks` / `dropout` / similar keys depending on the preset). Set encoder dropout probability to `0.2` (or `0.2` where appropriate). Save the file.
 
-[//]: # (- [Ignore label]&#40;documentation/ignore_label.md&#41;)
+Example (pseudo‑JSON snippet):
 
-## Where does nnU-Net perform well and where does it not perform?
-nnU-Net excels in segmentation problems that need to be solved by training from scratch, 
-for example: research applications that feature non-standard image modalities and input channels,
-challenge datasets from the biomedical domain, majority of 3D segmentation problems, etc . We have yet to find a 
-dataset for which nnU-Net's working principle fails!
+```json
+"encoder": {
+  "dropout_prob": 0.2
+}
+```
 
-Note: On standard segmentation 
-problems, such as 2D RGB images in ADE20k and Cityscapes, fine-tuning a foundation model (that was pretrained on a large corpus of 
-similar images, e.g. Imagenet 22k, JFT-300M) will provide better performance than nnU-Net! That is simply because these 
-models allow much better initialization. Foundation models are not supported by nnU-Net as 
-they 1) are not useful for segmentation problems that deviate from the standard setting (see above mentioned 
-datasets), 2) would typically only support 2D architectures and 3) conflict with our core design principle of carefully adapting 
-the network topology for each dataset (if the topology is changed one can no longer transfer pretrained weights!) 
+3) Train the model
 
-## What happened to the old nnU-Net?
-The core of the old nnU-Net was hacked together in a short time period while participating in the Medical Segmentation 
-Decathlon challenge in 2018. Consequently, code structure and quality were not the best. Many features 
-were added later on and didn't quite fit into the nnU-Net design principles. Overall quite messy, really. And annoying to work with.
+Use your standard training command, ensuring the trainer loads the edited plans file. Example (adapt to your trainer name):
 
-nnU-Net V2 is a complete overhaul. The "delete everything and start again" kind. So everything is better 
-(in the author's opinion haha). While the segmentation performance [remains the same](https://docs.google.com/spreadsheets/d/13gqjIKEMPFPyMMMwA1EML57IyoBjfC3-QCTn4zRN_Mg/edit?usp=sharing), a lot of cool stuff has been added. 
-It is now also much easier to use it as a development framework and to manually fine-tune its configuration to new 
-datasets. A big driver for the reimplementation was also the emergence of [Helmholtz Imaging](http://helmholtz-imaging.de), 
-prompting us to extend nnU-Net to more image formats and domains. Take a look [here](documentation/changelog.md) for some highlights.
+```bash
+python -m nnunetv2.run.training --dataset <TASK_ID> --plans /path/to/plans_3d_fullres.json --trainer YourTrainer
+```
 
-# Acknowledgements
-<img src="documentation/assets/HI_Logo.png" height="100px" />
+4) Confirm dropout layers exist
 
-<img src="documentation/assets/dkfz_logo.png" height="100px" />
+Run the provided helper to confirm dropout layers are present in the trained model:
 
-nnU-Net is developed and maintained by the Applied Computer Vision Lab (ACVL) of [Helmholtz Imaging](http://helmholtz-imaging.de) 
-and the [Division of Medical Image Computing](https://www.dkfz.de/en/mic/index.php) at the 
-[German Cancer Research Center (DKFZ)](https://www.dkfz.de/en/index.html).
+```bash
+python check_dropout_layers.py --model-folder /path/to/trainer/output/fold_0
+```
+
+5) Run MC‑Dropout inference
+
+Edit top of `run_mc_dropout_inference.py` to set input, output, model path, folds and checkpoint names. Then run on the cluster or locally.
+
+Local example:
+
+```bash
+python run_mc_dropout_inference.py
+```
+
+Example sbatch job for a SLURM cluster (Amarel style):
+
+```bash
+#!/bin/bash
+#SBATCH --gres=gpu:1
+#SBATCH --mem=64G
+#SBATCH --time=04:00:00
+#SBATCH --cpus-per-task=8
+module load anaconda
+conda activate nnunetv2
+cd /path/to/repo
+python run_mc_dropout_inference.py
+```
+
+Notes on inference:
+- The canonical predictor used here is `nnunetv2/inference/predict_with_mc_dropout_edited.py`. This script enables dropout at inference time and samples multiple stochastic forward passes to compute mean prediction and uncertainty maps.
+- Outputs: segmentation predictions and uncertainty maps (written to `nnUNet_results` by default). Check the script headers for exact file naming.
+
+6) Evaluation
+
+Use included evaluation utilities to compute metrics on predictions. Example:
+
+```python
+from nnunetv2.evaluation.evaluate_predictions import compute_metrics_on_folder
+# compute_metrics_on_folder(gt_folder, pred_folder, output_csv)
+```
+
+Or use any wrapper script you prefer. The repository contains helpers under `nnunetv2/evaluation`.
+
+7) Visualization
+
+- The visualization script that includes segmentation contours and applies the orientation fix (transpose `(2,1,0)`) is `nnunetv2/visualization/visualize_seg_and_uncertainty.py`.
+- The uncertainty‑only overlay script is `nnunetv2/visualization/create_proper_uncertainty_overlay.py`.
+- The provided Windows runner is `nnunetv2/visualization/run_visualization.ps1`. On Linux you can call the Python scripts directly:
+
+```bash
+python nnunetv2/visualization/visualize_seg_and_uncertainty.py
+python nnunetv2/visualization/create_proper_uncertainty_overlay.py --original /path/to/case_0000.nii.gz --uncertainty /path/to/case_uncertainty.nii.gz -o /path/to/out
+```
+
+Important: `visualize_seg_and_uncertainty.py` contains the explicit transpose step used to correct orientation for our uncertainty volumes:
+
+```python
+unc_data = np.transpose(unc_data, (2,1,0))
+```
+
+This rotation was determined by inspection (the rotation test is `simple_rotation_test.py`). If your uncertainty maps are already in `(x,y,z)` order you do not need the transpose.
+
+## Key files and purpose
+- `nnunetv2/inference/predict_with_mc_dropout_edited.py` — MC‑Dropout predictor used for inference.
+- `run_mc_dropout_inference.py` — top‑level runner that calls the predictor (edit constants at top to set paths and folds).
+- `check_dropout_layers.py` — helper that checks model files for dropout layers.
+- `nnunetv2/visualization/visualize_seg_and_uncertainty.py` — canonical visualizer (applies orientation fix `(2,1,0)` and draws contours).
+- `nnunetv2/visualization/create_proper_uncertainty_overlay.py` — uncertainty‑only, attractive overlays (3‑view, multislice, best slice).
+- `nnunetv2/visualization/run_visualization.ps1` — Windows PowerShell helper to run either visualizer.
+- `nnunetv2/evaluation/` — evaluation helpers and scripts used to compute metrics.
+
+## Backups and history
+- Backup folders created during cleanup: `inference_backup_YYYYMMDD_HHMMSS` and `visualization_backup_YYYYMMDD_HHMMSS` at the repository root (look for folders with these prefixes). Example commit SHAs relevant to recent cleanup operations: `403b9a8`, `194a320`.
+
+## Minimal checklist to reproduce
+1. Set env vars and install dependencies.
+2. Preprocess dataset using nnU‑Net standard steps.
+3. Edit full‑res plans JSON and set encoder dropout to `0.2`.
+4. Train model with edited plans.
+5. Confirm dropout exists with `python check_dropout_layers.py`.
+6. Configure `run_mc_dropout_inference.py` and run it on the cluster.
+7. Compute metrics and visualize using the visualization scripts (use transpose `(2,1,0)` if needed).
+
+## Contact / notes
+If you have questions about a specific change or need the exact commands and job scripts used in a particular run, I can add a precise audit log (timestamps and exact `sbatch` calls) to the repo. Ask me to append an `AUDIT.md` and I will add it.
+
+---
+Version: MC‑Dropout adaptation (documented). See `nnunetv2/inference/predict_with_mc_dropout_edited.py` for the main implementation.
