@@ -221,7 +221,7 @@ nib.save(nifti_img, output_path)
 
 Use the provided inference script with one of these options:
 
-**Option A: Ensemble Inference (All 5 Folds) - Recommended**
+**Option A: Ensemble Inference (All 5 Folds) - FINAL MODEL**
 
 ```bash
 python nnunetv2/inference/predict_with_mc_dropout_edited.py \
@@ -238,7 +238,7 @@ Benefits:
 - More robust and generalizable predictions
 - Better calibrated uncertainty estimates
 
-**Option B: Single Fold Inference**
+**Option B: Single Fold Inference - FOR TESTING INFERENCE SCRIPT**
 
 ```bash
 python nnunetv2/inference/predict_with_mc_dropout_edited.py \
