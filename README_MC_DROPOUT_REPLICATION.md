@@ -107,7 +107,7 @@ All 5 fold checkpoints should contain Dropout3d modules with p=0.2.
 
 ### Using the Trained Folds
 
-**Option 1: Ensemble Predictions (Recommended)**
+**Ensemble Predictions**
 
 Use all 5 folds for ensemble inference to improve robustness:
 
@@ -124,19 +124,6 @@ This averages predictions across all 5 folds plus MC Dropout sampling, providing
 - More stable predictions
 - Better uncertainty quantification
 - Improved generalization to test data
-
-**Option 2: Single Fold Inference**
-
-Use a specific fold (e.g., fold 0):
-
-```bash
-python nnunetv2/inference/predict_with_mc_dropout_edited.py \
-    --dataset_folder "nnUNet_preprocessed/Dataset777_BraTS2024/imagesTr" \
-    --output_folder "./predictions" \
-    --model_folder "nnUNet_results/Dataset777_BraTS2024/nnUNetTrainer__nnUNetPlans__3d_fullres" \
-    --num_samples 20 \
-    --folds 0
-```
 
 ---
 
