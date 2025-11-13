@@ -169,12 +169,14 @@ def create_combined_visualization(orig_file, seg_file, unc_file, output_dir, cas
         seg_slice_T = seg_slice.T
         
         # 1. Show grayscale anatomy
-        ax.imshow(orig_slice_T, cmap='gray', origin='lower', aspect='auto',
+        # Use origin='upper' to flip image right-side-up (eyes/nose at top, not bottom)
+        ax.imshow(orig_slice_T, cmap='gray', origin='upper', aspect='auto',
                   vmin=0, vmax=1)
         
         # 2. Overlay uncertainty (red/yellow heatmap with HIGH visibility)
         # Use 'hot' colormap: black (0) -> red (0.33) -> orange (0.66) -> yellow (1.0)
-        im = ax.imshow(unc_slice_T, cmap='hot', origin='lower', aspect='auto',
+        # origin='upper' flips to correct orientation
+        im = ax.imshow(unc_slice_T, cmap='hot', origin='upper', aspect='auto',
                        alpha=0.9, vmin=0, vmax=0.7)  # Lower vmax to make colors brighter
         
         # 3. Add segmentation contours (purple/blue outlines)

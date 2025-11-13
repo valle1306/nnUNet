@@ -137,4 +137,13 @@ scratch/
 *.nii.gz
 *.mha
 
-# End nnUNet-specific ignoresnnunetv2/inference/obsolete_backup_*
+# End nnUNet-specific ignores
+
+# ------ Internal documentation and collaboration files (between collaborators) ------
+# These are internal notes and references, not part of the reproducible workflow
+training_files/
+scripts/FETCH_TRAINING_FILES_GUIDE.md
+scripts/fetch_training_files_from_amarel.ps1
+scripts/remove_inference_and_push_master.ps1
+
+nnunetv2/inference/obsolete_backup_*
