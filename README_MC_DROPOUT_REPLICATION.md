@@ -67,26 +67,76 @@ print(f"Plans verified: dropout_op_kwargs = {config['dropout_op_kwargs']}")
 
 ---
 
-## Phase 2: Training
+## Phase 2: Training with 5-Fold Cross-Validation
 
-Once the plans are modified, training proceeds using the standard nnU-Net training command:
+Once the plans are modified, training proceeds using standard nnU-Net 5-fold cross-validation:
+
+```bash
+# Train all 5 folds
+for fold in 0 1 2 3 4; do
+    nnUNetv2_train Dataset777_BraTS2024 3d_fullres $fold -tr nnUNetTrainer
+done
+```
+
+Or individually:
 
 ```bash
 nnUNetv2_train Dataset777_BraTS2024 3d_fullres 0 -tr nnUNetTrainer
+nnUNetv2_train Dataset777_BraTS2024 3d_fullres 1 -tr nnUNetTrainer
+nnUNetv2_train Dataset777_BraTS2024 3d_fullres 2 -tr nnUNetTrainer
+nnUNetv2_train Dataset777_BraTS2024 3d_fullres 3 -tr nnUNetTrainer
+nnUNetv2_train Dataset777_BraTS2024 3d_fullres 4 -tr nnUNetTrainer
 ```
 
 **During training:**
 
 - The network builds without dropout in the architecture (arch_kwargs.dropout_op: null)
 - The configuration wrapper adds Dropout3d(p=0.2) layers after initialization
-- Dropout is active during all 250-500 epochs, providing regularization
+- Dropout is active during all epochs (typically 250-500), providing regularization
 - Validation runs without dropout active (standard practice)
+- Each fold trains on 80% of data and validates on 20% (non-overlapping splits)
 
 **Verification after training:**
 
-1. Check the generated `plans.json` in the results directory contains your dropout_op_kwargs
-2. Check debug.json in fold_0 for the dropout configuration in the configuration_manager output
-3. Check the trained checkpoint file contains Dropout3d modules with p=0.2
+Each fold produces:
+1. `checkpoint_final_fold{0-4}.pth` - Trained weights for each fold
+2. `debug.json` in each fold directory for dropout configuration in the configuration_manager output
+3. `plans.json` - Single shared configuration with your dropout_op_kwargs
+
+All 5 fold checkpoints should contain Dropout3d modules with p=0.2.
+
+### Using the Trained Folds
+
+**Option 1: Ensemble Predictions (Recommended)**
+
+Use all 5 folds for ensemble inference to improve robustness:
+
+```bash
+python nnunetv2/inference/predict_with_mc_dropout_edited.py \
+    --dataset_folder "nnUNet_preprocessed/Dataset777_BraTS2024/imagesTr" \
+    --output_folder "./predictions" \
+    --model_folder "nnUNet_results/Dataset777_BraTS2024/nnUNetTrainer__nnUNetPlans__3d_fullres" \
+    --num_samples 20 \
+    --folds 0 1 2 3 4
+```
+
+This averages predictions across all 5 folds plus MC Dropout sampling, providing:
+- More stable predictions
+- Better uncertainty quantification
+- Improved generalization to test data
+
+**Option 2: Single Fold Inference**
+
+Use a specific fold (e.g., fold 0):
+
+```bash
+python nnunetv2/inference/predict_with_mc_dropout_edited.py \
+    --dataset_folder "nnUNet_preprocessed/Dataset777_BraTS2024/imagesTr" \
+    --output_folder "./predictions" \
+    --model_folder "nnUNet_results/Dataset777_BraTS2024/nnUNetTrainer__nnUNetPlans__3d_fullres" \
+    --num_samples 20 \
+    --folds 0
+```
 
 ---
 
@@ -182,26 +232,56 @@ nib.save(nifti_img, output_path)
 
 ### Step 3.3: Running Inference
 
-Use the provided inference script:
+Use the provided inference script with one of these options:
+
+**Option A: Ensemble Inference (All 5 Folds) - Recommended**
 
 ```bash
 python nnunetv2/inference/predict_with_mc_dropout_edited.py \
     --dataset_folder "/path/to/preprocessed/dataset" \
     --output_folder "/path/to/predictions" \
     --model_folder "/path/to/trained/model" \
-    --num_samples 20
+    --num_samples 20 \
+    --folds 0 1 2 3 4
 ```
 
-**Parameters:**
+Benefits:
+- Averages predictions from all 5 cross-validation folds
+- Combined with MC Dropout (20 samples per fold = 100 total predictions per case)
+- More robust and generalizable predictions
+- Better calibrated uncertainty estimates
 
-- `--num_samples`: Number of MC Dropout forward passes (typically 20-50)
+**Option B: Single Fold Inference**
+
+```bash
+python nnunetv2/inference/predict_with_mc_dropout_edited.py \
+    --dataset_folder "/path/to/preprocessed/dataset" \
+    --output_folder "/path/to/predictions" \
+    --model_folder "/path/to/trained/model" \
+    --num_samples 20 \
+    --folds 0
+```
+
+Use this for:
+- Faster inference (single model instead of ensemble)
+- Testing or debugging
+- Memory-constrained environments
+
+**Common Parameters:**
+
+- `--num_samples`: Number of MC Dropout forward passes per fold (typically 20-50)
   - More samples = better uncertainty estimates but slower inference
   - 20 provides good balance between quality and speed
+  - With 5 folds: 20 samples × 5 folds = 100 total stochastic passes per case
+- `--folds`: Which fold checkpoints to use (space-separated)
+  - `0 1 2 3 4` - Use all 5 folds (default, recommended)
+  - `0` - Use only fold 0
 
-**Output:**
+**Output Files:**
 
-- `prediction_<case_id>.nii.gz` - Mean prediction (averaged over samples)
-- `uncertainty_<case_id>.nii.gz` - Uncertainty map (variance across samples)
+For each case, the script generates:
+- `prediction_<case_id>.nii.gz` - Ensemble mean prediction (averaged over samples and folds)
+- `uncertainty_<case_id>.nii.gz` - Ensemble uncertainty map (variance across samples and folds)
 
 ---
 
@@ -254,17 +334,20 @@ nnUNetv2_plan_and_preprocess -d 777 -c 3d_fullres
 # Edit: nnUNet_preprocessed/Dataset777_BraTS2024/nnUNetPlans_3d_fullres.json
 # Add: "dropout_op_kwargs": {"p": 0.2, "inplace": false}
 
-# Step 3: Train with dropout
-nnUNetv2_train Dataset777_BraTS2024 3d_fullres 0 -tr nnUNetTrainer
+# Step 3: Train all 5 folds with dropout
+for fold in 0 1 2 3 4; do
+    nnUNetv2_train Dataset777_BraTS2024 3d_fullres $fold -tr nnUNetTrainer
+done
 
-# Step 4: Run inference with MC Dropout
+# Step 4: Run ensemble inference with MC Dropout (all 5 folds)
 python nnunetv2/inference/predict_with_mc_dropout_edited.py \
     --dataset_folder "nnUNet_preprocessed/Dataset777_BraTS2024/imagesTr" \
     --output_folder "./predictions" \
     --model_folder "nnUNet_results/Dataset777_BraTS2024/nnUNetTrainer__nnUNetPlans__3d_fullres" \
-    --num_samples 20
+    --num_samples 20 \
+    --folds 0 1 2 3 4
 
-# Step 5: Visualize predictions
+# Step 5: Visualize predictions with uncertainty
 python nnunetv2/visualization/visualize_seg_and_uncertainty.py
 ```
 
@@ -304,6 +387,61 @@ The custom inference script is critical because:
 4. **Affine Preservation**: Original image affine matrix ensures correct registration
 
 Without proper mapping, predictions would be spatially offset from the original image.
+
+---
+
+## Downloading Pre-trained Models from Amarel
+
+If you have trained models on a remote cluster (e.g., Amarel), download the trained fold checkpoints:
+
+### Download All 5 Fold Checkpoints
+
+**Using SCP (Linux/Mac/Windows PowerShell):**
+
+```bash
+# Download all fold checkpoints
+for fold in 0 1 2 3 4; do
+    scp "user@amarel.rutgers.edu:/path/to/nnUNet_results/Dataset777_BraTS2024/nnUNetTrainer__nnUNetPlans__3d_fullres/fold_${fold}/checkpoint_final.pth" \
+        "./checkpoint_final_fold${fold}.pth"
+done
+
+# Download shared configuration files
+scp "user@amarel.rutgers.edu:/path/to/nnUNet_results/Dataset777_BraTS2024/nnUNetTrainer__nnUNetPlans__3d_fullres/plans.json" \
+    "./plans.json"
+```
+
+### Directory Structure After Download
+
+```
+./
+├── checkpoint_final_fold0.pth
+├── checkpoint_final_fold1.pth
+├── checkpoint_final_fold2.pth
+├── checkpoint_final_fold3.pth
+├── checkpoint_final_fold4.pth
+└── plans.json
+```
+
+### Place Checkpoints in Correct Location
+
+nnU-Net expects models in:
+
+```
+nnUNet_results/Dataset777_BraTS2024/nnUNetTrainer__nnUNetPlans__3d_fullres/
+├── fold_0/
+│   └── checkpoint_final.pth
+├── fold_1/
+│   └── checkpoint_final.pth
+├── fold_2/
+│   └── checkpoint_final.pth
+├── fold_3/
+│   └── checkpoint_final.pth
+├── fold_4/
+│   └── checkpoint_final.pth
+└── plans.json
+```
+
+After downloading, organize your checkpoints in these directories.
 
 ---
 
