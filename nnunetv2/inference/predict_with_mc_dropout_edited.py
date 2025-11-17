@@ -38,12 +38,12 @@ from nnunetv2.utilities.utils import create_lists_from_splitted_dataset_folder
 
 def enable_mc_dropout(model):
     """
-    Enable dropout layers during inference for MC Dropout and set dropout rate to p=0.05
-    Also checks that all Dropout layers are set to p=0.05.
+    Enable dropout layers during inference for MC Dropout and set dropout rate to p
+    Also checks that all Dropout layers are set to p=.
     """
     for m in model.modules():
         if m.__class__.__name__.startswith('Dropout'):
-            m.p = 0.05
+            # m.p = 0.05
             m.train()
     # Check all Dropout layers
     incorrect = []

@@ -8,7 +8,7 @@ The MC Dropout workflow consists of four phases:
 
 1. **Phase 1: Plans Modification** - Enable Dropout3d in the training configuration
 2. **Phase 2: Training** - Train the network with Dropout3d(p=0.2) for regularization
-3. **Phase 3: Inference** - Use the trained model with Dropout3d(p=0.05) for MC Dropout uncertainty estimation
+3. **Phase 3: Inference** - Use the trained model with MC Dropout for uncertainty estimation
 4. **Phase 4: Visualization** - Create combined segmentation and uncertainty overlay images
 
 ---
@@ -99,28 +99,28 @@ nnUNetv2_train Dataset777_BraTS2024 3d_fullres 4 -tr nnUNetTrainer
 **Verification after training:**
 
 Each fold produces:
-1. `checkpoint_final_fold{0-4}.pth` - Trained weights for each fold
-2. `debug.json` in each fold directory for dropout configuration in the configuration_manager output
+1. `checkpoint_final.pth` - Trained weights for the fold
+2. `debug.json` in each fold directory showing dropout configuration in configuration_manager output
 3. `plans.json` - Single shared configuration with your dropout_op_kwargs
 
 All 5 fold checkpoints should contain Dropout3d modules with p=0.2.
 
 ### Using the Trained Folds
 
-**Option 1: Ensemble Predictions (Recommended)**
+**Option 1: Ensemble Inference (Recommended)**
 
 Use all 5 folds for ensemble inference to improve robustness:
 
 ```bash
 python nnunetv2/inference/predict_with_mc_dropout_edited.py \
-    --dataset_folder "nnUNet_preprocessed/Dataset777_BraTS2024/imagesTr" \
-    --output_folder "./predictions" \
-    --model_folder "nnUNet_results/Dataset777_BraTS2024/nnUNetTrainer__nnUNetPlans__3d_fullres" \
-    --num_samples 20 \
-    --folds 0 1 2 3 4
+    -i /path/to/input/images \
+    -o /path/to/output \
+    -m /path/to/trained/model \
+    -f 0 1 2 3 4 \
+    --verbose
 ```
 
-This averages predictions across all 5 folds plus MC Dropout sampling, providing:
+This averages predictions across all 5 folds, providing:
 - More stable predictions
 - Better uncertainty quantification
 - Improved generalization to test data
@@ -131,12 +131,79 @@ Use a specific fold (e.g., fold 0):
 
 ```bash
 python nnunetv2/inference/predict_with_mc_dropout_edited.py \
-    --dataset_folder "nnUNet_preprocessed/Dataset777_BraTS2024/imagesTr" \
-    --output_folder "./predictions" \
-    --model_folder "nnUNet_results/Dataset777_BraTS2024/nnUNetTrainer__nnUNetPlans__3d_fullres" \
-    --num_samples 20 \
-    --folds 0
+    -i /path/to/input/images \
+    -o /path/to/output \
+    -m /path/to/trained/model \
+    -f 0 \
+    --verbose
 ```
+
+### Running Inference on HPC Clusters (SLURM)
+
+For large datasets or when GPU resources are available on HPC clusters, use SLURM batch scripts.
+
+**Example SLURM Script** (`inference_brats_amarel.sbatch`):
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=nnunet_inference_mc
+#SBATCH --output=inference_%j.out
+#SBATCH --error=inference_%j.err
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=08:00:00
+#SBATCH --partition=gpu
+#SBATCH --gres=gpu:1
+
+# Load modules (if needed)
+module load cuda/11.8
+
+# Activate conda environment
+source ~/.bashrc
+conda activate nnunetv2
+
+# Set environment variables
+export nnUNet_raw="/path/to/nnUNet_raw"
+export nnUNet_preprocessed="/path/to/nnUNet_preprocessed"
+export nnUNet_results="/path/to/nnUNet_results"
+
+# Navigate to repository
+cd ~/nnUNet
+
+# Run inference with all 5 folds
+python nnunetv2/inference/predict_with_mc_dropout_edited.py \
+    -i ${nnUNet_raw}/Dataset777_BraTSPED2024/imagesTs \
+    -o /path/to/inference_output_mc_dropout \
+    -m ${nnUNet_results}/Dataset777_BraTSPED2024/nnUNetTrainer__nnUNetPlans__3d_fullres \
+    -f 0 1 2 3 4 \
+    --verbose \
+    --disable_progress_bar
+```
+
+**Submit the job:**
+
+```bash
+# Convert line endings if uploading from Windows
+dos2unix inference_brats_amarel.sbatch
+
+# Submit to SLURM scheduler
+sbatch inference_brats_amarel.sbatch
+
+# Monitor job status
+squeue -u $USER
+
+# View output logs
+tail -f inference_<jobid>.out
+```
+
+**Key SLURM Parameters:**
+
+- `--cpus-per-task=8`: Number of CPU cores (adjust based on available resources)
+- `--mem=64G`: Memory allocation (nnU-Net requires significant RAM for 3D volumes)
+- `--gres=gpu:1`: Request 1 GPU (MC Dropout benefits from GPU acceleration)
+- `--time=08:00:00`: Maximum runtime (adjust based on dataset size)
+- `--disable_progress_bar`: Recommended for batch jobs to avoid cluttering log files
 
 ---
 
@@ -149,25 +216,31 @@ The custom inference script (`nnunetv2/inference/predict_with_mc_dropout_edited.
 ```python
 def enable_mc_dropout(model):
     """
-    Enable dropout during inference and set all Dropout layers to p=0.05.
+    Enable dropout during inference by keeping dropout layers in training mode.
     
-    During inference:
-    - MC Dropout uses lower probability (p=0.05) than training (p=0.2)
-    - This provides uncertainty calibration without excessive stochasticity
-    - Multiple forward passes (typically 20-50) sample different dropout masks
+    This function ensures dropout layers remain active during inference,
+    allowing for stochastic forward passes needed for uncertainty estimation.
     """
     for m in model.modules():
         if m.__class__.__name__.startswith('Dropout'):
-            m.p = 0.05        # Reduce from training p=0.2 to inference p=0.05
-            m.train()          # Keep dropout active during inference
+            m.train()                # Keep dropout ACTIVE during inference
 ```
 
-**Rationale for p=0.05:**
+**How MC Dropout Works:**
 
-- Training uses p=0.2 to prevent overfitting during supervised learning
-- Inference uses p=0.05 (lower) because we only need stochasticity for uncertainty, not regularization
-- This is supported by Concrete Dropout (Gal et al., 2017), which shows optimal uncertainty dropout rates differ from training rates
-- Lower inference dropout produces more stable yet diverse predictions
+MC Dropout treats dropout as a Bayesian approximation, enabling uncertainty quantification through:
+
+1. **Training Phase**: Model trained with Dropout3d(p=0.2) for regularization
+2. **Inference Phase**: Dropout layers kept active (in .train() mode) instead of being disabled
+3. **Multiple Forward Passes**: 20 stochastic forward passes performed per input
+4. **Uncertainty Estimation**: Variance across passes quantifies model uncertainty
+
+**Key Implementation Details:**
+
+- **Dropout Rate**: Uses training dropout rate (p=0.2) during inference
+- **Number of Passes**: 20 forward passes (hard-coded in prediction function)
+- **Ensemble**: Combines predictions from all 5 cross-validation folds
+- **Output**: Mean prediction and uncertainty maps for each segmentation class
 
 ### Step 3.2: Handling Spatial Cropping in Inference
 
@@ -238,16 +311,16 @@ Use the provided inference script with one of these options:
 
 ```bash
 python nnunetv2/inference/predict_with_mc_dropout_edited.py \
-    --dataset_folder "/path/to/preprocessed/dataset" \
-    --output_folder "/path/to/predictions" \
-    --model_folder "/path/to/trained/model" \
-    --num_samples 20 \
-    --folds 0 1 2 3 4
+    -i /path/to/input/images \
+    -o /path/to/output \
+    -m /path/to/trained/model \
+    -f 0 1 2 3 4 \
+    --verbose
 ```
 
 Benefits:
 - Averages predictions from all 5 cross-validation folds
-- Combined with MC Dropout (20 samples per fold = 100 total predictions per case)
+- Combined with MC Dropout (20 forward passes per fold)
 - More robust and generalizable predictions
 - Better calibrated uncertainty estimates
 
@@ -255,11 +328,11 @@ Benefits:
 
 ```bash
 python nnunetv2/inference/predict_with_mc_dropout_edited.py \
-    --dataset_folder "/path/to/preprocessed/dataset" \
-    --output_folder "/path/to/predictions" \
-    --model_folder "/path/to/trained/model" \
-    --num_samples 20 \
-    --folds 0
+    -i /path/to/input/images \
+    -o /path/to/output \
+    -m /path/to/trained/model \
+    -f 0 \
+    --verbose
 ```
 
 Use this for:
@@ -341,11 +414,11 @@ done
 
 # Step 4: Run ensemble inference with MC Dropout (all 5 folds)
 python nnunetv2/inference/predict_with_mc_dropout_edited.py \
-    --dataset_folder "nnUNet_preprocessed/Dataset777_BraTS2024/imagesTr" \
-    --output_folder "./predictions" \
-    --model_folder "nnUNet_results/Dataset777_BraTS2024/nnUNetTrainer__nnUNetPlans__3d_fullres" \
-    --num_samples 20 \
-    --folds 0 1 2 3 4
+    -i /path/to/input/images \
+    -o /path/to/output \
+    -m /path/to/trained/model \
+    -f 0 1 2 3 4 \
+    --verbose
 
 # Step 5: Visualize predictions with uncertainty
 python nnunetv2/visualization/visualize_seg_and_uncertainty.py
@@ -370,12 +443,13 @@ nnU-Net uses a two-stage dropout configuration:
    - Purpose: Configuration wrapper adds Dropout3d after network initialization
    - This is the ACTUAL dropout used during training and inference
 
-### Why Lower Dropout for Inference?
+### MC Dropout Implementation Details
 
-- **Training (p=0.2)**: Regularizes by forcing robustness to missing activations
-- **Inference (p=0.05)**: Minimal stochasticity to sample uncertainty without instability
-- **Theoretical Support**: Concrete Dropout (Gal et al., 2017) shows these can differ
-- **Practical Benefit**: p=0.05 uncertainty is better calibrated for decision-making
+- **Training**: Model uses Dropout3d(p=0.2) for regularization during training
+- **Inference**: Same dropout rate (p=0.2) used during MC Dropout inference passes
+- **Forward Passes**: 20 stochastic forward passes performed (hard-coded)
+- **Theoretical Basis**: MC Dropout approximates Bayesian inference (Gal & Ghahramani, 2016)
+- **Practical Result**: Uncertainty quantification without retraining ensemble models
 
 ### Spatial Mapping in Custom Inference
 
@@ -455,9 +529,9 @@ After downloading, organize your checkpoints in these directories.
 
 ### Issue: Uncertainty maps show all zeros
 
-**Cause**: Dropout not active during inference or only single forward pass
+**Cause**: Dropout not active during inference or insufficient forward passes
 
-**Solution**: Ensure `enable_mc_dropout()` is called and sets `m.train()`. Verify `num_samples > 1`
+**Solution**: Ensure `enable_mc_dropout()` is called to set dropout layers to .train() mode. Verify the script performs multiple forward passes (20 passes are hard-coded in the prediction function).
 
 ### Issue: Uncertainty maps misaligned with segmentation
 
@@ -493,7 +567,7 @@ This workflow enables uncertainty quantification in medical image segmentation b
 
 1. Modifying nnU-Net plans to enable Dropout3d(p=0.2) during training
 2. Training the network with dropout regularization
-3. Adapting dropout to p=0.05 during inference for uncertainty sampling
+3. Keeping dropout active during inference for uncertainty sampling
 4. Properly handling spatial cropping through inverse transformations
 5. Visualizing predictions with uncertainty overlays
 
