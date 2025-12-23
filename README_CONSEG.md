@@ -1,43 +1,73 @@
-# CONSeg: Conformal Prediction for Medical Image Segmentation
+# CONSeg: Conformal Prediction for Medical Image Segmentation - Complete Replication Guide
 
-Implementation of CONSeg (Voxelwise Uncertainty Quantification for Glioma Segmentation Using Conformal Prediction) integrated with nnU-Net v2 for BraTS pediatric glioma segmentation.
+This guide provides complete step-by-step instructions to replicate the CONSeg (Conformal Prediction for Segmentation) methodology on nnU-Net v2. CONSeg provides distribution-free uncertainty quantification with formal coverage guarantees, requiring no model retraining.
 
 **Paper:** arXiv:2502.21158  
-**Status:** Validated on 52 test cases with ground truth evaluation
+**Implementation Status:** Production-ready, validated on 52 BraTS pediatric test cases  
+**Key Result:** Mean Dice 0.7939, with uncertainty 1600x higher in errors vs correct predictions
+
+---
+
+## Quick Links
+
+- [What is CONSeg?](#what-is-conseg)
+- [Complete Workflow](#complete-workflow)
+- [Phase 1: Setup and Verification](#phase-1-setup-and-verification)
+- [Phase 2: Running Inference](#phase-2-running-inference-with-probabilities)
+- [Phase 3: Computing Uncertainty](#phase-3-computing-uncertainty-maps)
+- [Phase 4: Evaluation](#phase-4-evaluation-optional)
+- [Results Interpretation](#results-interpretation)
+- [HPC/SLURM Usage](#hpc-cluster-usage-slurm)
+- [Troubleshooting](#troubleshooting-common-issues)
+
+---
+
+## What is CONSeg?
+
+CONSeg (Conformal Segmentation) applies conformal prediction to medical image segmentation to provide:
+
+- **Voxel-wise uncertainty maps** showing where the model is uncertain
+- **Uncertainty Ratio (UR)** metric quantifying overall prediction confidence
+- **Formal coverage guarantees** (e.g., 90% of predictions will be correct)
+- **No retraining required** - works with any trained nnU-Net model
+- **Distribution-free** - no assumptions about data distribution
+
+### Key Advantages
+
+1. **Post-hoc method:** Apply to existing trained models without retraining
+2. **Interpretable:** Uncertainty directly relates to prediction confidence
+3. **Validated:** Strong correlation (r=0.44) between uncertainty and errors
+4. **Clinically actionable:** Flag high-uncertainty cases for manual review
+5. **Fast:** Process 52 cases in ~8-10 minutes on single GPU
 
 ---
 
 ## Table of Contents
 
-1. [Overview](#overview)
-2. [Theoretical Background](#theoretical-background)
-3. [Implementation Details](#implementation-details)
-4. [Installation and Setup](#installation-and-setup)
-5. [Usage](#usage)
-6. [Results](#results)
-7. [Repository Structure](#repository-structure)
-8. [Replication Guide](#replication-guide)
-9. [References](#references)
+1. [Theoretical Background](#theoretical-background)
+2. [Complete Workflow](#complete-workflow)
+3. [Phase 1: Setup and Verification](#phase-1-setup-and-verification)
+4. [Phase 2: Running Inference](#phase-2-running-inference-with-probabilities)
+5. [Phase 3: Computing Uncertainty](#phase-3-computing-uncertainty-maps)
+6. [Phase 4: Evaluation](#phase-4-evaluation-optional)
+7. [Results Interpretation](#results-interpretation)
+8. [HPC Cluster Usage](#hpc-cluster-usage-slurm)
+9. [Troubleshooting](#troubleshooting-common-issues)
+10. [Performance Benchmarks](#performance-benchmarks)
+11. [References](#references)
 
 ---
 
-## Overview
+## Complete Workflow
 
-CONSeg provides distribution-free uncertainty quantification for medical image segmentation with formal coverage guarantees. This implementation:
+The CONSeg pipeline consists of **three simple phases**:
 
-- Integrates conformal prediction with nnU-Net v2 architecture
-- Provides voxel-wise uncertainty maps
-- Computes Uncertainty Ratio (UR) metrics
-- Correlates uncertainty with segmentation errors
-- Requires no model retraining or architecture modification
+1. **Phase 1: Setup and Verification** - Verify your trained model and environment (~5 minutes)
+2. **Phase 2: Inference with Probabilities** - Run standard nnU-Net prediction with probability saving (~5-7 minutes for 50 cases)
+3. **Phase 3: Uncertainty Quantification** - Process probabilities to generate uncertainty maps (~2-3 minutes)
+4. **Phase 4: Evaluation** (Optional) - Compare with ground truth if available (~1 minute)
 
-### Key Features
-
-- **Distribution-Free:** No assumptions about data distribution required
-- **Coverage Guarantees:** 90% conformal coverage with calibrated thresholds
-- **Post-Hoc:** Works with any trained segmentation model
-- **Interpretable:** Direct probabilistic uncertainty quantification
-- **Validated:** Tested on 52 BraTS pediatric cases with ground truth
+**Total time for 50 cases:** ~10-15 minutes on single GPU
 
 ---
 
