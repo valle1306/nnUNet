@@ -1,0 +1,12 @@
+{
+  "case_id": "BraTS-PED-00215",
+  "uncertainty_ratio": 0.0005259856630824372,
+  "mean_nonconformity": 0.00017612785450182855,
+  "median_nonconformity": 0.0,
+  "std_nonconformity": 0.006713439244776964,
+  "max_nonconformity": 0.5,
+  "min_nonconformity": 0.0,
+  "threshold": 0.1,
+  "num_uncertain_voxels": 4696,
+  "total_voxels": 8928000
+}

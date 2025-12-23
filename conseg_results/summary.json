@@ -1,0 +1,17 @@
+{
+  "method": "CONSeg - Conformal Prediction for Segmentation",
+  "paper": "arXiv:2502.21158",
+  "conformal_threshold": 0.1,
+  "coverage_level": 0.9,
+  "num_cases_processed": 52,
+  "num_cases_total": 52,
+  "uncertainty_ratio_statistics": {
+    "mean": 0.0004544044665012407,
+    "median": 0.00043469982078853044,
+    "std": 0.00022893354497581175,
+    "min": 0.00011570340501792115,
+    "max": 0.0012290546594982078,
+    "q25": 0.0003064236111111111,
+    "q75": 0.0005797211021505377
+  }
+}
